@@ -115,11 +115,14 @@ StrikeSync follows a decoupled server–client architecture to maximize performa
 
 ### Python Server Setup
 
-Clone the repository
+#### Clone the repository
 
 git clone https://github.com/technospes/strikesync-project.git
 cd strikesync-project/Python_Server
-Install dependencies
+
+text
+
+#### Install dependencies
 
 pip install torch ultralytics opencv-python orjson numpy
 
