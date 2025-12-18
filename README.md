@@ -113,14 +113,12 @@ StrikeSync follows a decoupled server–client architecture to maximize performa
 - Webcam  
 - NVIDIA GPU (recommended for CUDA acceleration)
 
-```
 ### Python Server Setup
 
 #### Clone the repository
-
+```
 git clone https://github.com/technospes/strikesync-project.git
 cd strikesync-project/Python_Server
-
 ```
 
 #### Install dependencies
@@ -271,14 +269,14 @@ Contributions are welcome.
 
 1. Fork the repository.  
 2. Create a feature branch:  
-
+```
 git checkout -b feature/NewMove
-
+```
 3. Commit your changes.  
 4. Push the branch:  
-
+```
 git push origin feature/NewMove
-
+```
 
 5. Open a Pull Request describing your change and test coverage.
 
