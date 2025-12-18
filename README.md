@@ -32,7 +32,7 @@ StrikeSync is a low-latency, markerless human–computer interface (HCI) that br
 
 ## Demo
 
-> Add GIFs / screenshots here (for example: `assets/strikesync_punch.gif`, `assets/strikesync_dodge.gif`).
+> ....In_Progress
 
 Examples:
 - Real-time combat where physical punches and dodges translate directly into in‑game actions.
