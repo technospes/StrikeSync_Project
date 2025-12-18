@@ -113,6 +113,7 @@ StrikeSync follows a decoupled server–client architecture to maximize performa
 - Webcam  
 - NVIDIA GPU (recommended for CUDA acceleration)
 
+```
 ### Python Server Setup
 
 #### Clone the repository
@@ -120,7 +121,7 @@ StrikeSync follows a decoupled server–client architecture to maximize performa
 git clone https://github.com/technospes/strikesync-project.git
 cd strikesync-project/Python_Server
 
-text
+```
 
 #### Install dependencies
 
@@ -173,7 +174,7 @@ The console should display a banner such as `YOLO11 Optimized Pose Server` and c
 - **Background & Clothing**: Wear clothing that contrasts with the background to improve YOLO keypoint stability.
 
 ---
-```text
+```
 ## Project Structure
 
 StrikeSync_Project/
@@ -273,14 +274,11 @@ Contributions are welcome.
 
 git checkout -b feature/NewMove
 
-text
-
 3. Commit your changes.  
 4. Push the branch:  
 
 git push origin feature/NewMove
 
-text
 
 5. Open a Pull Request describing your change and test coverage.
 
