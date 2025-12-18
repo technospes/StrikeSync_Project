@@ -1,0 +1,17 @@
+Right Hand Collider values (sphere) :
+center = -0.06,0.02,0
+radius = 0.22
+
+Right Leg Collider values (capsule) :
+center = -0.02,0.1,0
+Radius = 0.1
+Height = 0.9
+
+Spine Collider values (capsule) :
+center = 0,0.03,0.02
+radius = 0.24
+Height = 0.77
+
+Head Collider values (sphere) :
+center = 0,0.08,0.06
+radius = 0.18
