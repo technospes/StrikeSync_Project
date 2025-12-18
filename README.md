@@ -123,8 +123,6 @@ Install dependencies
 
 pip install torch ultralytics opencv-python orjson numpy
 
-text
-
 > For GPU acceleration, ensure you install a PyTorch build with CUDA support matching your driver and CUDA toolkit version.
 
 ### Unity Client Setup
@@ -143,8 +141,6 @@ text
    From the `Python_Server` directory:
 
 python pose_server.py
-
-text
 
 The console should display a banner such as `YOLO11 Optimized Pose Server` and confirm that the camera stream is active.
 
@@ -174,7 +170,7 @@ The console should display a banner such as `YOLO11 Optimized Pose Server` and c
 - **Background & Clothing**: Wear clothing that contrasts with the background to improve YOLO keypoint stability.
 
 ---
-
+```text
 ## Project Structure
 
 StrikeSync_Project/
@@ -196,7 +192,7 @@ StrikeSync_Project/
 │ └── Packages/ # Unity package dependencies
 └── README.md
 
-text
+```
 
 ---
 
