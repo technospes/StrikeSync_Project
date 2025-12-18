@@ -293,5 +293,5 @@ Distributed under the MIT License. See `LICENSE` for details.
 
 **Technospes**
 
-- GitHub: [https://github.com/technospes](https://github.com/technospes)  
-- LinkedIn (Ayush Shukla): [https://www.linkedin.com/in/ayushshukla-ar/](https://www.linkedin.com/in/ayushshukla-ar/)
+- GitHub (Technospes): https://github.com/technospes
+- LinkedIn (Ayush Shukla): https://www.linkedin.com/in/ayushshukla-ar/
