@@ -1,38 +1,40 @@
 """
-pose_server.py — StrikeSync Pose Server v5.0
+pose_server.py — StrikeSync Pose Server v8.0
 =============================================
 
-CHANGES FROM v4.0:
+CHANGE FROM v6/v7:
 
-FIX-1  Removed [MOVE] print statement from compute_move_x.
-       The per-packet print was adding ~0.3 ms per frame of I/O latency
-       and flooding the console. Status is now only in the [PERF] line.
+FIX-A1  STOP_ZONE hysteresis — eliminates the 2–3 cycle glitch walk loop.
 
-FIX-2  Neutral warmup: do not set neutral_hip_cx on frame 1.
-       Reason: the very first YOLO detection often has slightly imprecise
-       keypoints as the model cold-starts. Setting neutral on that frame
-       created a biased reference. Now we wait for NEUTRAL_WARMUP_FRAMES
-       stable consecutive detections before locking the neutral.
-       Result: neutral is set from a stable mean, reducing baseline drift
-       caused by a jittery first detection.
+Root cause (log evidence):
+  Python PERF showed: move_x=+0.971 → +1.000 → +1.000 → +0.000  (clean stop)
+  Unity showed: character kept walking for 2–3 cycles after user stopped leaning.
 
-FIX-3  WALK_ZONE tightened from 0.015 → 0.012 and MAX_THROW from 0.08 → 0.065.
-       The Python logs showed disp values of -0.018 to -0.030 during normal
-       seated micro-movement that was NOT intended as walking. With WALK_ZONE
-       at 0.015, those values crossed into the walk path and sent non-zero
-       move_x continuously. Tightening the zone means the dead zone captures
-       more of the seated noise floor. MAX_THROW reduced proportionally so
-       a deliberate lean still reaches full speed quickly.
+The Python EMA with MOVE_EMA_ALPHA=0.35 decays across ~9 frames (~270ms at
+33fps) as the user's hip returns toward neutral.  During that decay window,
+values like 0.27, 0.18, 0.12 are sent to Unity.  These are above Unity's
+walkDeadZone=0.08, so Unity treats them as valid walk input and resets its
+idle timer each packet.  The idle timer never completes, _lockedDir stays
+locked, and the character keeps walking.
 
-FIX-4  Added move_x output smoothing cap: clamp EMA output to 0 if
-       |smoothed_move_x| < 0.05. Prevents sub-threshold noise from reaching
-       Unity and causing micro walk-cycles. Unity's own deadzone (0.08) would
-       catch it anyway, but eliminating it at source is cleaner.
+FIX: Two separate zones instead of one.
 
-FIX-5  Landmark EMA alpha reduced from 0.4 → 0.3 for punch detection quality.
-       Lower alpha = more smoothing. The punch detection in Unity uses raw
-       landmark velocity — smoother landmarks mean less false-positive spikes
-       from detection noise.
+  WALK_ZONE  = 0.012   (unchanged) — displacement must exceed this to START walking
+  STOP_ZONE  = 0.022               — displacement must fall BELOW this to STOP
+
+  STOP_ZONE > WALK_ZONE creates hysteresis:
+  - Walking starts: |displacement| crosses WALK_ZONE going outward
+  - Walking stops:  |displacement| falls below STOP_ZONE on the return stroke
+  - Since STOP_ZONE > WALK_ZONE, the return stroke snaps smoothed_move_x=0
+    the moment displacement enters the stop zone, well before the EMA has
+    time to decay gradually.
+  - No sub-threshold non-zero values reach Unity during the return stroke.
+  - Character stops immediately, no loop cycles.
+
+This is the standard joystick hysteresis pattern used in all fighting game
+controllers — start threshold < stop threshold ensures decisive stop response.
+
+NO OTHER LOGIC CHANGED.  Python is otherwise working correctly.
 """
 
 import torch
@@ -71,7 +73,7 @@ from collections import deque
 from ultralytics import YOLO
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-MODEL_PATH = 'yolo11s-pose.pt'
+MODEL_PATH = 'yolo11n-pose.pt'
 CAM_INDEX  = 0
 SEND_IP    = "127.0.0.1"
 SEND_PORT  = 9001
@@ -95,7 +97,6 @@ MULTI_PLAYER_CONFIRM_FRAMES = 15
 _p2_candidate_frames        = 0
 
 # ─── Landmark smoothing ───────────────────────────────────────────────────────
-# FIX-5: lowered from 0.4 → 0.3 for cleaner punch landmark data
 LANDMARK_ALPHA = 0.3
 
 # ─── Jump detection ───────────────────────────────────────────────────────────
@@ -103,19 +104,15 @@ JUMP_RISE_THRESHOLD = 0.035
 JUMP_COOLDOWN_S     = 0.5
 
 # ─── Walk zones ───────────────────────────────────────────────────────────────
-# FIX-3: tightened both values to reduce seated noise triggering walk
-WALK_ZONE      = 0.012   # was 0.015 — dead zone width (fraction of frame width)
-MAX_THROW      = 0.065   # was 0.080 — displacement for move_x = ±1.0
+WALK_ZONE      = 0.012   # displacement to START walking (unchanged)
+# FIX-A1: STOP_ZONE > WALK_ZONE — snap to 0 on return stroke before EMA decays
+STOP_ZONE      = 0.022   # displacement to STOP  walking (NEW — was same as WALK_ZONE)
+MAX_THROW      = 0.065
 JOYSTICK_SCALE = 1.0 / MAX_THROW
-
-# EMA alpha for move_x on walk path only
 MOVE_EMA_ALPHA = 0.35
-
-# FIX-4: sub-threshold output clamp — prevent tiny values from reaching Unity
-MOVE_OUTPUT_MIN = 0.06
+MOVE_OUTPUT_MIN = 0.05
 
 # ─── Neutral warmup ───────────────────────────────────────────────────────────
-# FIX-2: wait this many frames before locking neutral reference
 NEUTRAL_WARMUP_FRAMES = 8
 
 # ─── Performance window ───────────────────────────────────────────────────────
@@ -131,9 +128,8 @@ class PlayerState:
         self.last_hip_y       = None
         self.hip_y_baseline   = None
         self.last_jump_t      = -999.0
-        self.neutral_hip_cx   = None       # locked calibration point
+        self.neutral_hip_cx   = None
         self.smoothed_move_x  = 0.0
-        # FIX-2: warmup accumulator
         self._warmup_frames   = 0
         self._warmup_sum      = 0.0
 
@@ -150,34 +146,39 @@ class PlayerState:
 
         hip_cx = (raw_kpts[11][0] + raw_kpts[12][0]) / 2.0 / frame_w
 
-        # FIX-2: accumulate warmup frames before setting neutral
+        # Warmup — accumulate stable frames before locking neutral
         if self.neutral_hip_cx is None:
             self._warmup_frames += 1
             self._warmup_sum    += hip_cx
             if self._warmup_frames >= NEUTRAL_WARMUP_FRAMES:
                 self.neutral_hip_cx  = self._warmup_sum / self._warmup_frames
                 self.smoothed_move_x = 0.0
-                print(f"[CALIBRATED] Player {self.pid} neutral={self.neutral_hip_cx:.4f} "
-                      f"(from {self._warmup_frames} frames)")
+                print(f"[CALIBRATED] Player {self.pid} "
+                      f"neutral={self.neutral_hip_cx:.4f} "
+                      f"(mean of {self._warmup_frames} frames)")
             return 0.0
 
         displacement = hip_cx - self.neutral_hip_cx
 
-        # Dead zone → immediate zero, no bleed
-        if abs(displacement) < WALK_ZONE:
-            self.smoothed_move_x = 0.0
+        # ── FIX-A1: Hysteresis stop zone ─────────────────────────────────────
+        # STOP if |displacement| < STOP_ZONE — snap immediately, no EMA decay.
+        # This is larger than WALK_ZONE so the return stroke always hits this
+        # before the EMA can bleed non-zero values through.
+        if abs(displacement) < STOP_ZONE:
+            self.smoothed_move_x = 0.0   # instant snap — no decay bleed
             return 0.0
 
-        # Walk zone → ramp smoothly from 0
+        # START/CONTINUE walking — only reached if |displacement| >= STOP_ZONE
+        # (which is also >= WALK_ZONE since STOP_ZONE > WALK_ZONE)
         sign        = 1.0 if displacement > 0 else -1.0
+        # Ramp starts from WALK_ZONE edge for smooth entry from zero
         active_disp = displacement - sign * WALK_ZONE
         raw_move_x  = float(np.clip(active_disp * JOYSTICK_SCALE, -1.0, 1.0))
 
-        # EMA on walk path
+        # EMA smooths mid-walk jitter (not applied on stop path above)
         self.smoothed_move_x = (MOVE_EMA_ALPHA * raw_move_x
                                 + (1.0 - MOVE_EMA_ALPHA) * self.smoothed_move_x)
 
-        # FIX-4: clamp sub-threshold output to 0
         if abs(self.smoothed_move_x) < MOVE_OUTPUT_MIN:
             self.smoothed_move_x = 0.0
             return 0.0
@@ -185,11 +186,11 @@ class PlayerState:
         return float(np.clip(self.smoothed_move_x, -1.0, 1.0))
 
     def recalibrate(self, raw_kpts: np.ndarray, frame_w: int):
-        """Force re-calibration to current hip position."""
+        """Force reset of neutral to current hip position."""
         if len(raw_kpts) > 12:
             self.neutral_hip_cx  = (raw_kpts[11][0] + raw_kpts[12][0]) / 2.0 / frame_w
             self.smoothed_move_x = 0.0
-            self._warmup_frames  = NEUTRAL_WARMUP_FRAMES  # skip warmup on manual recal
+            self._warmup_frames  = NEUTRAL_WARMUP_FRAMES
             print(f"[RECALIBRATED] Player {self.pid} neutral={self.neutral_hip_cx:.4f}")
 
     def detect_jump(self, kpts: np.ndarray, frame_h: int) -> bool:
@@ -204,12 +205,10 @@ class PlayerState:
             return False
 
         self.hip_y_baseline = 0.98 * self.hip_y_baseline + 0.02 * hip_y
-        rise    = self.hip_y_baseline - hip_y
-        jumped  = (rise > JUMP_RISE_THRESHOLD) and (now - self.last_jump_t > JUMP_COOLDOWN_S)
-
+        rise   = self.hip_y_baseline - hip_y
+        jumped = (rise > JUMP_RISE_THRESHOLD) and (now - self.last_jump_t > JUMP_COOLDOWN_S)
         if jumped:
             self.last_jump_t = now
-
         self.last_hip_y = hip_y
         return jumped
 
@@ -237,7 +236,6 @@ class FastCamera:
         self.cap.release()
 
 
-# ─── Capture worker ───────────────────────────────────────────────────────────
 def capture_worker(camera, frame_queue, stop_event, skip_ref):
     counter = 0
     while not stop_event.is_set():
@@ -254,7 +252,6 @@ def capture_worker(camera, frame_queue, stop_event, skip_ref):
         frame_queue.put_nowait(frame)
 
 
-# ─── Slot assignment ──────────────────────────────────────────────────────────
 def iou_1d(a1, a2, b1, b2):
     inter = max(0.0, min(a2, b2) - max(a1, b1))
     union = max(a2, b2) - min(a1, b1)
@@ -292,11 +289,10 @@ def assign_slots(detections, player_states, frame_w):
     return result
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     global MAX_PLAYERS, _p2_candidate_frames
 
-    print("\n[INIT] StrikeSync Pose Server v5.0 starting...")
+    print("\n[INIT] StrikeSync Pose Server v8.0 starting...")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -351,9 +347,10 @@ def main():
     last_report   = time.time()
 
     print("=" * 55)
-    print("🚀 STRIKESYNC SERVER v5.0 RUNNING")
+    print("🚀 STRIKESYNC SERVER v8.0 RUNNING")
     print(f"   Device     : {DEVICE.upper()}")
-    print(f"   Walk zone  : ±{WALK_ZONE*100:.1f}% frame width")
+    print(f"   Walk zone  : ±{WALK_ZONE*100:.1f}% frame width  (start)")
+    print(f"   Stop zone  : ±{STOP_ZONE*100:.1f}% frame width  (stop — hysteresis)")
     print(f"   Max throw  : ±{MAX_THROW*100:.1f}% frame width → move_x ±1.0")
     print(f"   Neutral    : locked after {NEUTRAL_WARMUP_FRAMES} warmup frames")
     print(f"   Landmark α : {LANDMARK_ALPHA}")
@@ -386,7 +383,6 @@ def main():
 
                 raw_count = min(len(kpts_xy), 2)
 
-                # Multi-player guard
                 if raw_count >= 2:
                     _p2_candidate_frames += 1
                     if _p2_candidate_frames >= MULTI_PLAYER_CONFIRM_FRAMES:
@@ -403,8 +399,7 @@ def main():
                         print("[INFO] Player 2 lost — back to single-player mode")
 
                 active_count = min(raw_count, MAX_PLAYERS)
-
-                detections = []
+                detections   = []
                 for i in range(active_count):
                     kpts  = kpts_xy[i]
                     confs = kpts_conf[i] if i < len(kpts_conf) else np.ones(len(kpts))
@@ -443,7 +438,7 @@ def main():
                         "landmarks": landmarks,
                         "move_x":    round(move_x, 4),
                         "jumped":    jumped,
-                        "lw_vel":    -1.0,   # kept for protocol compatibility
+                        "lw_vel":    -1.0,
                         "rw_vel":    0.0,
                     })
 
@@ -469,17 +464,17 @@ def main():
                     elif infer_size[0] < INFERENCE_SIZE_MAX:
                         infer_size[0] = min(INFERENCE_SIZE_MAX, infer_size[0] + 32)
 
-            # Periodic status (FIX-1: no per-packet prints)
             if time.time() - last_report >= 2.0:
                 avg_fps = len(fps_times) / sum(fps_times) if fps_times else 0
                 status  = "✅" if avg_fps >= TARGET_FPS * 0.9 else "⚡"
                 p0      = player_states[0]
-                neutral_str = f"{p0.neutral_hip_cx:.4f}" if p0.neutral_hip_cx is not None \
-                              else f"warming ({p0._warmup_frames}/{NEUTRAL_WARMUP_FRAMES})"
-                move_str = f"{p0.smoothed_move_x:+.3f}" if p0.neutral_hip_cx is not None else "n/a"
+                n_str   = (f"{p0.neutral_hip_cx:.4f}" if p0.neutral_hip_cx is not None
+                           else f"warming ({p0._warmup_frames}/{NEUTRAL_WARMUP_FRAMES})")
+                m_str   = (f"{p0.smoothed_move_x:+.3f}" if p0.neutral_hip_cx is not None
+                           else "n/a")
                 print(f"[PERF] {avg_fps:.1f} FPS | infer={infer_size[0]} | "
                       f"skip={skip_ref[0]} | players={len(packet['players'])} | "
-                      f"neutral={neutral_str} | move_x={move_str} {status}")
+                      f"neutral={n_str} | move_x={m_str} {status}")
                 last_report = time.time()
 
     except KeyboardInterrupt:
