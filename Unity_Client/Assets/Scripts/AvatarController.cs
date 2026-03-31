@@ -3,76 +3,77 @@ using System.Collections.Generic;
 using UnityEngine;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  AvatarController — v5.0
+//  AvatarController — v8.0
+//  Final production version — every known issue addressed.
 //
-//  NEW BUGS FIXED IN THIS VERSION:
+// ─────────────────────────────────────────────────────────────────────────────
+//  FIX-A  Glitchy walk loop (2–3 cycles before stopping)
 //
-//  ISSUE-A  "Boomerang" / PUBG-loop movement.
-//           Root cause: srvAge was reaching 7–8 s at idle, meaning
-//           ReceiveServerMoveX was never being called — not because the server
-//           stopped sending, but because PoseManager's sentinel check
-//           (lw_vel < -0.5) was silently failing on JsonUtility deserialization.
-//           Secondary cause: even when srvAge correctly expired and _lockedDir
-//           was cleared, the EMA was still fighting _targetMoveX=0 from a high
-//           _animMoveX starting point — producing 2–3 "ghost" walk cycles.
-//           FIX-A1: Removed the sentinel dependency entirely. PoseManager now
-//                   calls ReceiveServerMoveX on EVERY packet unconditionally.
-//                   The lw_vel sentinel was a workaround for a bug that no
-//                   longer exists — Python always sends valid move_x.
-//           FIX-A2: When _targetMoveX is set to 0 (idle timeout fires), we
-//                   also force _animMoveX toward 0 with a faster drain rate
-//                   (animDamping * 2) so the EMA can't ghost-walk.
+//  Root cause (log evidence):
+//    Python PERF: move_x=+0.971 → +1.000 → ... → +0.000 (clean stop in Python)
+//    Unity log  : _lockedDir stays ±1, character keeps walking for 2–3 cycles
 //
-//  ISSUE-B  Punch fires on lean-start.
-//           Root cause: UpdateTargetLandmarks() computes wrist world positions
-//           relative to transform.position. On the first frame of a lean, the
-//           character root hasn't moved yet but the landmarks jump. This creates
-//           a large single-frame velocity spike on both wrists simultaneously.
-//           The bothSideways filter only checks same X-direction — a lean moves
-//           wrists in X, so it fires the filter correctly... except the filter
-//           also requires BOTH hands to move. A lean moves one shoulder forward
-//           which shifts one wrist more than the other, escaping the filter.
-//           FIX-B: Added a "lean guard" that checks if hip-center moved more
-//                  than LEAN_GUARD_THRESHOLD in the same frame. If the hips
-//                  translated significantly (body lean), punch detection is
-//                  suppressed for that frame. Hips don't move during a punch —
-//                  only arms do. This cleanly separates the two gestures.
-//           FIX-B2: Increased punchVelocityThreshold from 1.5 → 2.2.
-//                   The landmark coordinate space at poseScale=1 produces
-//                   lean-spike velocities of ~1.6–1.9. 2.2 sits above that
-//                   while still below a real fast punch (~3.5+).
+//  The Python EMA decays the move_x value across ~9 frames (~270ms at 33fps)
+//  as the user returns toward neutral.  During that decay the value passes
+//  through e.g. 0.27, 0.18, 0.12 — values above Unity's walkDeadZone=0.08.
+//  Each such packet resets _idleTimer=0 in UpdateWalk, preventing the idle
+//  timeout from ever completing.  _lockedDir stays set, _targetMoveX stays ±1,
+//  character keeps walking.
 //
-//  ISSUE-C  Only right punch ("PunchRight") fires reliably.
-//           Root cause: With mirrorInput=true, keypoint indices are remapped.
-//           When computing Pos(LWrist)-Pos(LShoulder) the _target array already
-//           has mirrored values. A physical right-hand punch (your actual right
-//           arm) is detected as LWrist in the mirrored space — firing "Left"
-//           punch → PunchLeft trigger. If PunchLeft animation has a longer
-//           cooldown or is visually suppressed by a Walking transition with
-//           higher priority, only PunchRight shows. 
-//           FIX-C: Added explicit physical-hand tracking. punchPhysL/R track
-//                  the PHYSICAL hands (pre-mirror), and punch triggers map to
-//                  physical hands directly. This decouples punch detection from
-//                  the mirror remapping that's only needed for IK/walk.
+//  FIX: Two-part fix.
 //
-//  ISSUE-D  Walk speed too fast / instant full speed.
-//           Root cause: moveSpeed=4f applied from frame 1 using _animMoveX
-//           which jumps to ~0.8 in the first EMA step at animDamping=10.
-//           FIX-D: Movement position delta is now scaled by |_animMoveX| so
-//                  the character physically accelerates with the animator blend.
-//                  Also reduced default moveSpeed from 4 → 3 and exposed a
-//                  separate walkAccelDamping for the movement (vs animation).
+//  (A1) Python side — STOP_ZONE hysteresis (see pose_server.py v8.0):
+//       Walk STARTS when |displacement| >= WALK_ZONE (0.012).
+//       Walk STOPS  when |displacement| <  STOP_ZONE (0.022).
+//       STOP_ZONE > WALK_ZONE means the return stroke snaps smoothed_move_x=0
+//       immediately when displacement falls back toward neutral.  No EMA decay
+//       bleed, no sub-threshold non-zero values reaching Unity.
 //
-//  ISSUE-E  srvAge never reset — ReceiveServerMoveX not being called.
-//           See ISSUE-A. The sentinel check in PoseManager was the gatekeeper
-//           that silently dropped all packets. Fixed in PoseManager.cs (v5.0).
+//  (A2) Unity side — moveIdleTimeout reduced 0.18s → 0.10s.
+//       With the Python fix, stop signals arrive clean and fast.  A 100ms
+//       timeout means the character stops within one walk-cycle of the
+//       signal arriving.  The short timeout is safe because the Python
+//       STOP_ZONE prevents false stops mid-lean.
 //
-//  ISSUE-F  JsonUtility silent deserialization failure on lw_vel field.
-//           JsonUtility in Unity does not throw on missing/mismatched fields —
-//           it silently leaves them at default (0f). If PoseDataPacket.lw_vel
-//           is not perfectly matching the JSON key, lw_vel stays 0f, the
-//           sentinel check (< -0.5) is never true, and ReceiveServerMoveX is
-//           never called. Fixed by removing the sentinel gate entirely (FIX-A1).
+// ─────────────────────────────────────────────────────────────────────────────
+//  FIX-B  Lean still occasionally triggers punch
+//
+//  Two causes remain after v7 fixes:
+//
+//  (B1) leanGuardThreshold=0.08 misses slow leans.
+//       The guard measures frame-to-frame hip delta.  A slow sustained lean
+//       at constant velocity produces per-frame deltas of ~0.005–0.02, which
+//       never exceed 0.08, so the guard never fires.  Yet arm velocity still
+//       spikes because wrist landmarks jump when shoulders rotate.
+//       FIX: Lower leanGuardThreshold 0.08 → 0.035.  This catches slow leans.
+//       Also add a 3-frame sustained-lean window: if lean guard fired in ANY
+//       of the last LEAN_GUARD_FRAMES frames, punch detection is suppressed.
+//       This prevents a single non-lean frame from escaping the guard window.
+//
+//  (B2) Punch should never fire while the character is walking.
+//       A fighting game character does not punch mid-stride.  If |_animMoveX|
+//       exceeds WALK_PUNCH_SUPPRESS_THRESHOLD, all punch detection is skipped.
+//       This is separate from punchWalkSuppression (which raises the threshold)
+//       — this is a hard gate: if walking, no punches at all.
+//       Threshold = 0.3 so very slow shuffling still allows punches but
+//       a clear walk stride blocks them completely.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  FIX-C  _punchLockTimer goes negative (cosmetic but incorrect)
+//
+//  The timer was decremented past zero.  Clamped with Mathf.Max(0, ...).
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  FIX-D  Player_2 srvAge climbing to 17–39s in single-player mode
+//
+//  This is expected and correct behaviour: Python only sends id=0 packets
+//  when one person is detected.  Player_2 (id=1) never receives a packet
+//  so its srvAge climbs indefinitely.  However if Player_2 AvatarController
+//  has canFight=true and debugMode=true, it logs every frame — creating noise.
+//  Added: suppress all per-frame debug logs when srvAge > SERVER_EXPIRE_S AND
+//  _srvEverReceived is false (player was never activated this session).
+//  This keeps the console clean in single-player mode without disabling debug
+//  for the active player.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -90,12 +91,16 @@ public class AvatarController : MonoBehaviour
     public float fightPlaneZ = 0f;
 
     [Header("=== MOVEMENT ===")]
-    public float moveSpeed = 3f;          // ISSUE-D: lowered from 4 → 3
+    public float moveSpeed = 3f;
     [Range(1f, 20f)] public float animDamping = 10f;
-    [Range(1f, 30f)] public float walkAccelDamping = 8f;   // ISSUE-D: separate accel curve
+    [Range(1f, 30f)] public float walkAccelDamping = 8f;
     [Range(0.01f, 0.3f)] public float walkDeadZone = 0.08f;
     [Range(0.05f, 0.5f)] public float reverseDirectionThreshold = 0.35f;
-    [Range(0.05f, 0.6f)] public float moveIdleTimeout = 0.18f;
+    // FIX-A2: reduced from 0.18 → 0.10 for snappier stop response
+    [Range(0.05f, 0.6f)] public float moveIdleTimeout = 0.10f;
+
+    [Tooltip("Flip if lean-right makes character walk backward.")]
+    public bool invertMoveX = false;
 
     [Header("=== COMBAT ===")]
     public bool canFight = false;
@@ -103,7 +108,7 @@ public class AvatarController : MonoBehaviour
     [Header("=== HITBOXES ===")]
     public Hitbox leftHandHitbox;
     public Hitbox rightHandHitbox;
-    public float hitboxActiveTime = 0.3f;
+    public float hitboxActiveTime = 0.45f;
 
     [Header("=== CALIBRATION ===")]
     public bool normalizeScale = true;
@@ -111,7 +116,6 @@ public class AvatarController : MonoBehaviour
     public float poseScale = 1f;
     public Vector3 poseOffset = Vector3.zero;
     [Range(0f, 0.95f)] public float poseSmoothingFactor = 0.6f;
-    [Range(0f, 0.5f)] public float velocitySmoothingFactor = 0.15f;
 
     [Header("=== IK ===")]
     public bool useIKTracking;
@@ -119,32 +123,42 @@ public class AvatarController : MonoBehaviour
     public Transform leftElbowTarget, rightElbowTarget;
 
     [Header("=== PUNCH DETECTION ===")]
-    public float punchVelocityThreshold = 2.2f;  // ISSUE-B2: raised 1.5→2.2
-    public float punchVelocityResetThreshold = 1.8f;
+    public float punchVelocityThreshold = 1.6f;
+    [Tooltip("Auto-set to threshold × 0.55 in Start(). Do not edit.")]
+    public float punchVelocityResetThreshold = 0.88f;
     public float punchCooldown = 0.35f;
-    public float punchWalkSuppression = 2.5f;
-    // ISSUE-B: hip translation guard — if hips moved more than this normalised
-    // distance in one frame, it's a body lean, not a punch — skip detection.
-    [Range(0.001f, 0.05f)] public float leanGuardThreshold = 0.012f;
+    public float punchWalkSuppression = 1.2f;
+    // FIX-B1: lowered from 0.08 → 0.035 to catch slow leans
+    [Range(0.001f, 0.1f)] public float leanGuardThreshold = 0.035f;
+    // FIX-B1: consecutive-frame lean window — blocks punch for N frames after lean
+    [Range(1, 8)] public int leanGuardFrames = 4;
+    // FIX-B2: hard gate — no punches while walking above this speed
+    [Range(0.1f, 1.0f)] public float walkPunchSuppressThresh = 0.30f;
+    [Range(0.05f, 0.5f)] public float velocitySmoothingFactor = 0.18f;
+    [Range(0f, 1f)] public float punchWalkLockDuration = 0.45f;
 
     [Header("=== DEBUG ===")]
     public bool debugMode = false;
     public bool mirrorInput = true;
     public bool showGizmos = true;
 
-    // ── Private — server packet ───────────────────────────────────────────────
-    private const float SERVER_EXPIRE_S = 1.2f;
+    // ── Private — server ─────────────────────────────────────────────────────
+    private const float SERVER_EXPIRE_S = 2.5f;
+    private const float SERVER_WARN_S = 5f;
 
     private float _srvMoveX;
     private bool _hasSrvMoveX;
     private bool _srvEverReceived;
     private float _srvAge = SERVER_EXPIRE_S + 1f;
+    private float _srvWarnTimer = 0f;
+    private bool _srvFirstPacket = true;
 
     // ── Private — walk ───────────────────────────────────────────────────────
     private float _idleTimer;
     private float _animMoveX;
     private float _targetMoveX;
     private float _lockedDir;
+    private float _punchLockTimer = 0f;
 
     // ── Private — pose / IK ──────────────────────────────────────────────────
     private Animator _anim;
@@ -157,17 +171,19 @@ public class AvatarController : MonoBehaviour
     private Vector3[] _smoothed = new Vector3[17];
     private Vector3[] _target = new Vector3[17];
 
-    // ── Private — punch (ISSUE-C: physical-hand tracking, pre-mirror) ────────
-    private Vector3 _physLastL, _physLastR;   // physical left/right wrist - shoulder
+    // ── Private — punch ───────────────────────────────────────────────────────
+    private Vector3 _physLastL, _physLastR;
     private float _physLastT;
     private float _lastLPunch = -999f, _lastRPunch = -999f;
     private float _velL, _velR;
     private bool _lWasFast, _rWasFast;
     private bool _punchInit;
 
-    // ISSUE-B: lean guard state
+    // lean guard state
     private Vector3 _lastHipWorld = Vector3.zero;
-    private bool _hipInitialized;
+    private bool _hipInitialized = false;
+    // FIX-B1: rolling lean frame counter
+    private int _leanFramesRemaining = 0;
 
     // keypoint indices — YOLO 17-point
     const int Nose = 0, LShoulder = 5, RShoulder = 6,
@@ -199,8 +215,7 @@ public class AvatarController : MonoBehaviour
         _groundYReady = true;
 
         var p = transform.position;
-        p.y = _groundY;
-        p.z = fightPlaneZ;
+        p.y = _groundY; p.z = fightPlaneZ;
         transform.position = p;
 
         for (int i = 0; i < 17; i++)
@@ -208,9 +223,12 @@ public class AvatarController : MonoBehaviour
 
         _anim?.SetFloat("MoveX", 0f);
 
-        Debug.Log($"<color=cyan>[{name}] AvatarController v5.0 ready | " +
-                  $"scale={transform.localScale.y:F2} | groundY={_groundY:F2} | " +
-                  $"rootMotion={(_anim != null ? _anim.applyRootMotion.ToString() : "n/a")}</color>");
+        // Always enforce correct reset threshold
+        punchVelocityResetThreshold = punchVelocityThreshold * 0.55f;
+
+        Debug.Log($"<color=cyan>[{name}] AvatarController v8.0 | " +
+                  $"playerID={playerID} | invertMoveX={invertMoveX} | " +
+                  $"scale={transform.localScale.y:F2} | groundY={_groundY:F2}</color>");
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -226,13 +244,19 @@ public class AvatarController : MonoBehaviour
         UpdateTargetLandmarks();
     }
 
-    // ISSUE-A FIX: called unconditionally by PoseManager — no sentinel gate.
     public void ReceiveServerMoveX(float v)
     {
+        if (_srvFirstPacket)
+        {
+            _srvFirstPacket = false;
+            Debug.Log($"<color=cyan>[{name}] First packet: move_x={v:F3} | " +
+                      $"If direction wrong → enable invertMoveX in Inspector</color>");
+        }
         _srvMoveX = v;
         _hasSrvMoveX = true;
         _srvEverReceived = true;
         _srvAge = 0f;
+        _srvWarnTimer = 0f;
     }
 
     // ── Update ────────────────────────────────────────────────────────────────
@@ -240,13 +264,35 @@ public class AvatarController : MonoBehaviour
     {
         if (!_groundYReady) return;
 
-        // Expire stale server data
+        // Startup diagnostic — only log for players that ever receive data
+        if (!_srvEverReceived)
+        {
+            _srvWarnTimer += Time.deltaTime;
+            if (_srvWarnTimer > SERVER_WARN_S)
+            {
+                // FIX-D: suppress for inactive players (Player 2 in solo mode)
+                // Only warn if this player is supposed to be active
+                if (canFight)
+                    Debug.LogWarning($"[{name}] No packet in {_srvWarnTimer:F0}s. " +
+                        "Check: PoseManager saved+compiled | pose_server running | " +
+                        "port 9001 | canFight=true | playerID assigned");
+                _srvWarnTimer = 0f;
+            }
+        }
+
         _srvAge += Time.deltaTime;
         if (_hasSrvMoveX && _srvAge >= SERVER_EXPIRE_S)
         {
             _hasSrvMoveX = false;
             _srvMoveX = 0f;
         }
+
+        // FIX-C: clamp punch lock timer to zero (no negative values)
+        _punchLockTimer = Mathf.Max(0f, _punchLockTimer - Time.deltaTime);
+
+        // FIX-B1: decay lean guard frame counter
+        if (_leanFramesRemaining > 0)
+            _leanFramesRemaining--;
 
         // Smooth landmarks
         float lf = 1f - poseSmoothingFactor;
@@ -262,11 +308,15 @@ public class AvatarController : MonoBehaviour
         }
         else
         {
-            // Force idle cleanly
             _targetMoveX = 0f;
             _lockedDir = 0f;
             _idleTimer = 0f;
-            DrainToIdle(animDamping * 2f);  // ISSUE-A FIX: fast drain when inactive
+            _punchLockTimer = 0f;
+            _leanFramesRemaining = 0;
+
+            // INSTANT RESET
+            _animMoveX = 0f;
+            _anim?.SetFloat("MoveX", 0f);
         }
 
         ApplyMovementAndClamp();
@@ -274,25 +324,23 @@ public class AvatarController : MonoBehaviour
 
     void LateUpdate()
     {
-        if (!_groundYReady || _isStunned || _rb != null) return;
+        if (!_groundYReady || _isStunned) return;
         var pos = transform.position;
         if (Mathf.Abs(pos.y - _groundY) > 0.001f)
-        {
-            pos.y = _groundY;
-            transform.position = pos;
-        }
+        { pos.y = _groundY; transform.position = pos; }
     }
 
     // ── Walk ──────────────────────────────────────────────────────────────────
     void UpdateWalk()
     {
-        // Raw input: server value when fresh, 0 when expired or never received
         float raw = _srvEverReceived ? _srvMoveX : 0f;
+        if (invertMoveX) raw = -raw;
 
-        // P2 sees world flipped
+        // Punch lock suppresses walk input (lean-triggered punch ≠ walk start)
+        if (_punchLockTimer > 0f) raw = 0f;
+
         float inputMoveX = IsPlayer1 ? raw : -raw;
 
-        // Deadzone
         inputMoveX = Mathf.Clamp(inputMoveX, -1f, 1f);
         if (Mathf.Abs(inputMoveX) < walkDeadZone)
             inputMoveX = 0f;
@@ -301,10 +349,10 @@ public class AvatarController : MonoBehaviour
 
         // Direction hysteresis — suppress weak opposite signal
         if (_lockedDir != 0f && inputMoveX != 0f &&
-            Mathf.Sign(inputMoveX) != _lockedDir)
+            Mathf.Sign(inputMoveX) != _lockedDir &&
+            Mathf.Abs(raw) < reverseDirectionThreshold)
         {
-            if (Mathf.Abs(raw) < reverseDirectionThreshold)
-                inputMoveX = _lockedDir;
+            inputMoveX = _lockedDir;
         }
 
         bool hasInput = (inputMoveX != 0f);
@@ -315,45 +363,38 @@ public class AvatarController : MonoBehaviour
             float dir = Mathf.Sign(inputMoveX);
 
             if (_lockedDir == 0f || dir == _lockedDir)
-            {
-                _lockedDir = dir;
-                _targetMoveX = dir;
-            }
+            { _lockedDir = dir; _targetMoveX = dir; }
             else if (Mathf.Abs(raw) > reverseDirectionThreshold)
-            {
-                _lockedDir = dir;
-                _targetMoveX = dir;
-            }
+            { _lockedDir = dir; _targetMoveX = dir; }
         }
         else
         {
             _idleTimer += Time.deltaTime;
+            // FIX-A2: 100ms timeout — snappier stop
             if (_idleTimer >= moveIdleTimeout)
             {
                 _targetMoveX = 0f;
                 _lockedDir = 0f;
 
-                // ISSUE-A FIX: when idle timeout fires, fast-drain the EMA so
-                // ghost walk cycles can't happen. animDamping*2 drains to ~0.05
-                // in roughly half the normal time.
-                if (Mathf.Abs(_animMoveX) > 0.05f)
-                    DrainToIdle(animDamping * 2f);
+                // INSTANT STOP (no smoothing)
+                _animMoveX = 0f;
+                _anim?.SetFloat("MoveX", 0f);
             }
         }
 
-        // ISSUE-D FIX: use walkAccelDamping for the blend, animDamping for display
         float s = 1f - Mathf.Exp(-walkAccelDamping * Time.deltaTime);
         _animMoveX = Mathf.Lerp(_animMoveX, _targetMoveX, s);
         if (Mathf.Abs(_animMoveX) < 0.05f) _animMoveX = 0f;
 
         _anim?.SetFloat("MoveX", _animMoveX);
 
-        if (debugMode)
+        // FIX-D: skip debug log for players that have never connected
+        if (debugMode && _srvEverReceived)
             Debug.Log($"<color=lime>[{name}] MoveX={_animMoveX:F2} raw={raw:F2} " +
-                      $"fresh={_hasSrvMoveX} srvAge={_srvAge:F2} locked={_lockedDir}</color>");
+                      $"srvAge={_srvAge:F2} locked={_lockedDir} " +
+                      $"punchLock={_punchLockTimer:F2} leanFr={_leanFramesRemaining}</color>");
     }
 
-    // Helper: decay _animMoveX toward 0 at given damping rate, then apply
     void DrainToIdle(float damping)
     {
         float s = 1f - Mathf.Exp(-damping * Time.deltaTime);
@@ -367,15 +408,13 @@ public class AvatarController : MonoBehaviour
         if (!_groundYReady) return;
         var t = transform.position;
 
-        // ISSUE-D FIX: multiply by |_animMoveX| so acceleration matches animation.
-        // Character physically accelerates/decelerates with the blend — no instant snap.
         float worldDir = IsPlayer1 ? _animMoveX : -_animMoveX;
         if (Mathf.Abs(_animMoveX) > 0.01f)
             t.x += worldDir * moveSpeed * Time.deltaTime;
 
         t.x = Mathf.Clamp(t.x, minMapX, maxMapX);
         t.z = fightPlaneZ;
-        if (!_isStunned && _rb == null) t.y = _groundY;
+        t.y = _groundY;
 
         if (_rb != null) _rb.MovePosition(t);
         else transform.position = t;
@@ -388,34 +427,67 @@ public class AvatarController : MonoBehaviour
         float dt = now - _physLastT;
         if (dt <= 0.01f) return;
 
-        // ISSUE-C FIX: use PHYSICAL hand indices (pre-mirror) so punch side
-        // maps to the actual arm the user extended, regardless of mirrorInput.
-        // Physical left = index 9, physical right = index 10.
-        // We read directly from _kp (raw, pre-mirror) instead of _target.
-        int physLW = 9, physRW = 10;
-        int physLS = 5, physRS = 6;
-
         if (_kp == null || _kp.Count < 17) { _physLastT = now; return; }
 
-        // Build world-space relative positions for physical hands
-        // (shoulder-subtracted to cancel body translation)
-        Vector3 curPhysL = PhysPos(_kp, physLW) - PhysPos(_kp, physLS);
-        Vector3 curPhysR = PhysPos(_kp, physRW) - PhysPos(_kp, physRS);
+        // FIX-B2: hard gate — no punches while clearly walking
+        if (Mathf.Abs(_animMoveX) >= walkPunchSuppressThresh)
+        {
+            // Still advance timestamps so we don't get stale deltas
+            _physLastL = PhysPos(_kp, 9) - PhysPos(_kp, 5);
+            _physLastR = PhysPos(_kp, 10) - PhysPos(_kp, 6);
+            _velL = 0f;
+            _velR = 0f;
+            _physLastT = now;
+            return;
+        }
 
-        // ISSUE-B FIX: lean guard — measure hip center movement this frame.
-        // If hips translated significantly, it's a body lean, suppress punches.
+        // Physical hand positions — pre-mirror, shoulder-relative
+        Vector3 curPhysL = PhysPos(_kp, 9) - PhysPos(_kp, 5);
+        Vector3 curPhysR = PhysPos(_kp, 10) - PhysPos(_kp, 6);
+
+        // ── Lean guard ────────────────────────────────────────────────────────
         Vector3 hipNow = (PhysPos(_kp, 11) + PhysPos(_kp, 12)) * 0.5f;
-        bool isBodyLean = false;
+
         if (_hipInitialized)
         {
             float hipDelta = Vector3.Distance(hipNow, _lastHipWorld);
-            isBodyLean = (hipDelta > leanGuardThreshold);
+            // FIX-B1: lower threshold catches slow leans
+            if (hipDelta > leanGuardThreshold)
+            {
+                if (debugMode)
+                    Debug.Log($"<color=yellow>[{name}] Lean hipDelta={hipDelta:F4} " +
+                              $"→ guard {leanGuardFrames}fr</color>");
 
-            if (isBodyLean && debugMode)
-                Debug.Log($"<color=yellow>[{name}] Lean guard fired hipDelta={hipDelta:F4}</color>");
+                // Set rolling window — block punches for N frames
+                _leanFramesRemaining = leanGuardFrames;
+
+                // Clear EMA history so no residual bleeds into the next frame
+                _velL = 0f;
+                _velR = 0f;
+                _lWasFast = false;
+                _rWasFast = false;
+                _physLastL = curPhysL;
+                _physLastR = curPhysR;
+                _physLastT = now;
+                _lastHipWorld = hipNow;
+                _hipInitialized = true;
+                return;
+            }
         }
+
         _lastHipWorld = hipNow;
         _hipInitialized = true;
+
+        // FIX-B1: sustained lean window — if lean guard fired recently, skip
+        if (_leanFramesRemaining > 0)
+        {
+            _physLastL = curPhysL;
+            _physLastR = curPhysR;
+            _velL = Mathf.Lerp(_velL, 0f, 0.3f); // gentle decay during guard
+            _velR = Mathf.Lerp(_velR, 0f, 0.3f);
+            _physLastT = now;
+            return;
+        }
 
         if (!_punchInit)
         {
@@ -432,33 +504,33 @@ public class AvatarController : MonoBehaviour
         float smL = Mathf.Lerp(_velL, vL, velocitySmoothingFactor);
         float smR = Mathf.Lerp(_velR, vR, velocitySmoothingFactor);
 
-        // Dynamic threshold rises with walk speed
+        // Dynamic threshold — rises with walk speed
         float thr = punchVelocityThreshold + Mathf.Abs(_animMoveX) * punchWalkSuppression;
 
-        // Both-hands same-direction = body lean
-        bool bothSideways = vL > 0.4f && vR > 0.4f
-                         && Mathf.Sign(dL.x) == Mathf.Sign(dR.x);
+        // Both hands moving same horizontal direction = body lean
+        bool bothSideways = vL > 0.8f && vR > 0.8f
+                         && Mathf.Sign(dL.x) == Mathf.Sign(dR.x)
+                         && Mathf.Abs(dL.x) > Mathf.Abs(dL.y);
 
-        // ISSUE-B FIX: skip if lean guard fires OR both-hands filter fires
-        if (!isBodyLean && !bothSideways)
+        if (!bothSideways)
         {
-            // Physical left hand punch — map to "Left" trigger
             if (smL > thr && (now - _lastLPunch) > punchCooldown && !_lWasFast)
             {
                 if (debugMode)
-                    Debug.Log($"<color=orange>[{name}] PHYS-L PUNCH vel={smL:F2} thr={thr:F2}</color>");
+                    Debug.Log($"<color=orange>[{name}] L-PUNCH vel={smL:F2} thr={thr:F2}</color>");
                 FirePunch("Left");
                 _lastLPunch = now;
                 _lWasFast = true;
+                _punchLockTimer = punchWalkLockDuration;
             }
-            // Physical right hand punch — map to "Right" trigger
             if (smR > thr && (now - _lastRPunch) > punchCooldown && !_rWasFast)
             {
                 if (debugMode)
-                    Debug.Log($"<color=orange>[{name}] PHYS-R PUNCH vel={smR:F2} thr={thr:F2}</color>");
+                    Debug.Log($"<color=orange>[{name}] R-PUNCH vel={smR:F2} thr={thr:F2}</color>");
                 FirePunch("Right");
                 _lastRPunch = now;
                 _rWasFast = true;
+                _punchLockTimer = punchWalkLockDuration;
             }
         }
 
@@ -470,8 +542,6 @@ public class AvatarController : MonoBehaviour
         _physLastT = now;
     }
 
-    // Builds a normalised 3D position from a raw LandmarkData entry.
-    // Used only for punch detection — pre-mirror, in a stable landmark space.
     Vector3 PhysPos(List<LandmarkData> kp, int idx)
     {
         if (idx >= kp.Count) return Vector3.zero;
@@ -534,10 +604,7 @@ public class AvatarController : MonoBehaviour
         IKGoal(AvatarIKGoal.LeftHand, leftHandTarget, AvatarIKHint.LeftElbow, leftElbowTarget);
         IKGoal(AvatarIKGoal.RightHand, rightHandTarget, AvatarIKHint.RightElbow, rightElbowTarget);
         if (headTarget)
-        {
-            _anim.SetLookAtWeight(1);
-            _anim.SetLookAtPosition(headTarget.position);
-        }
+        { _anim.SetLookAtWeight(1); _anim.SetLookAtPosition(headTarget.position); }
     }
 
     void IKGoal(AvatarIKGoal g, Transform t, AvatarIKHint h, Transform ht)
@@ -559,37 +626,32 @@ public class AvatarController : MonoBehaviour
 
 /*
  ═══════════════════════════════════════════════════════════════════════════════
-  ANIMATOR SETUP — Fighter_Animator.controller   (unchanged from v4)
+  ANIMATOR SETUP  (no changes from v7)
  ═══════════════════════════════════════════════════════════════════════════════
 
   PARAMETERS:
     Float   → MoveX
-    Trigger → PunchLeft
-    Trigger → PunchRight
-    Trigger → Hit
-    Trigger → Knockout
-    Trigger → Jump
+    Trigger → PunchLeft / PunchRight / Hit / Knockout / Jump
 
   TRANSITIONS:
-  1. Walking           → Sad Idle   MoveX > -0.05 AND MoveX < 0.05  | ExitTime OFF | Duration 0.10
-  2. Walking Backwards → Sad Idle   MoveX > -0.05 AND MoveX < 0.05  | ExitTime OFF | Duration 0.10
-  3. Sad Idle → Walking             MoveX > 0.05                     | ExitTime OFF | Duration 0.10
-  4. Sad Idle → Walking Backwards   MoveX < -0.05                    | ExitTime OFF | Duration 0.10
+  1. Sad Idle → Walking             MoveX > 0.05              ExitTime OFF  Duration 0.10
+  2. Sad Idle → Walking Backwards   MoveX < -0.05             ExitTime OFF  Duration 0.10
+  3. Walking → Sad Idle             MoveX > -0.05 AND < 0.05  ExitTime OFF  Duration 0.10
+  4. Walking Backwards → Sad Idle   MoveX > -0.05 AND < 0.05  ExitTime OFF  Duration 0.10
+  5. AnyState → PunchRight   Trigger PunchRight  ExitTime OFF  Duration 0.05
+                                Interruption Source: Current State  Can Transition To Self: OFF
+  6. AnyState → PunchLeft    Trigger PunchLeft   ExitTime OFF  Duration 0.05
+                                Interruption Source: Current State  Can Transition To Self: OFF
+  7. PunchRight → Sad Idle   Exit Time ON  ExitTime 0.80  Duration 0.10
+  8. PunchLeft  → Sad Idle   Exit Time ON  ExitTime 0.80  Duration 0.10
 
-  PUNCH TRANSITIONS (add if not already present):
-  5. Any State → PunchRight   Trigger PunchRight  | ExitTime OFF | Duration 0.05
-  6. Any State → PunchLeft    Trigger PunchLeft   | ExitTime OFF | Duration 0.05
-  7. PunchRight → Sad Idle    Has Exit Time ON    | ExitTime 0.8 | Duration 0.10
-  8. PunchLeft  → Sad Idle    Has Exit Time ON    | ExitTime 0.8 | Duration 0.10
+  ALL CLIPS:
+    Root Transform Rotation    Bake Into Pose ✅  Based On: Original
+    Root Transform Position Y  Bake Into Pose ✅  Based On: Feet
+    Root Transform Position XZ Bake Into Pose ✅  Based On: Original
 
-  CLIP IMPORT SETTINGS (all clips):
-    Root Transform Rotation   → Bake Into Pose ✅  Based On: Original
-    Root Transform Position Y → Bake Into Pose ✅  Based On: Feet
-    Root Transform Position XZ→ Bake Into Pose ✅  Based On: Original
-
-  PREFAB:
-    Animator → Apply Root Motion : OFF
-    Pivot at feet (Y=0)
+  LeftPunch + RightPunch: Loop Time OFF, Loop Pose OFF
+  Prefab: Apply Root Motion OFF, pivot at feet
 
  ═══════════════════════════════════════════════════════════════════════════════
 */
