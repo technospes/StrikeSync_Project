@@ -18,7 +18,8 @@
 *.userprefs
 *.pidb
 *.booproj
-*.svd
+*.
+.vs/
 *.pdb
 *.opendb
 *.VC.db

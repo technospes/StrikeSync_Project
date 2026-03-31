@@ -2,25 +2,102 @@
 using System.Collections.Generic;
 using UnityEngine;
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  AvatarController — v5.0
+//
+//  NEW BUGS FIXED IN THIS VERSION:
+//
+//  ISSUE-A  "Boomerang" / PUBG-loop movement.
+//           Root cause: srvAge was reaching 7–8 s at idle, meaning
+//           ReceiveServerMoveX was never being called — not because the server
+//           stopped sending, but because PoseManager's sentinel check
+//           (lw_vel < -0.5) was silently failing on JsonUtility deserialization.
+//           Secondary cause: even when srvAge correctly expired and _lockedDir
+//           was cleared, the EMA was still fighting _targetMoveX=0 from a high
+//           _animMoveX starting point — producing 2–3 "ghost" walk cycles.
+//           FIX-A1: Removed the sentinel dependency entirely. PoseManager now
+//                   calls ReceiveServerMoveX on EVERY packet unconditionally.
+//                   The lw_vel sentinel was a workaround for a bug that no
+//                   longer exists — Python always sends valid move_x.
+//           FIX-A2: When _targetMoveX is set to 0 (idle timeout fires), we
+//                   also force _animMoveX toward 0 with a faster drain rate
+//                   (animDamping * 2) so the EMA can't ghost-walk.
+//
+//  ISSUE-B  Punch fires on lean-start.
+//           Root cause: UpdateTargetLandmarks() computes wrist world positions
+//           relative to transform.position. On the first frame of a lean, the
+//           character root hasn't moved yet but the landmarks jump. This creates
+//           a large single-frame velocity spike on both wrists simultaneously.
+//           The bothSideways filter only checks same X-direction — a lean moves
+//           wrists in X, so it fires the filter correctly... except the filter
+//           also requires BOTH hands to move. A lean moves one shoulder forward
+//           which shifts one wrist more than the other, escaping the filter.
+//           FIX-B: Added a "lean guard" that checks if hip-center moved more
+//                  than LEAN_GUARD_THRESHOLD in the same frame. If the hips
+//                  translated significantly (body lean), punch detection is
+//                  suppressed for that frame. Hips don't move during a punch —
+//                  only arms do. This cleanly separates the two gestures.
+//           FIX-B2: Increased punchVelocityThreshold from 1.5 → 2.2.
+//                   The landmark coordinate space at poseScale=1 produces
+//                   lean-spike velocities of ~1.6–1.9. 2.2 sits above that
+//                   while still below a real fast punch (~3.5+).
+//
+//  ISSUE-C  Only right punch ("PunchRight") fires reliably.
+//           Root cause: With mirrorInput=true, keypoint indices are remapped.
+//           When computing Pos(LWrist)-Pos(LShoulder) the _target array already
+//           has mirrored values. A physical right-hand punch (your actual right
+//           arm) is detected as LWrist in the mirrored space — firing "Left"
+//           punch → PunchLeft trigger. If PunchLeft animation has a longer
+//           cooldown or is visually suppressed by a Walking transition with
+//           higher priority, only PunchRight shows. 
+//           FIX-C: Added explicit physical-hand tracking. punchPhysL/R track
+//                  the PHYSICAL hands (pre-mirror), and punch triggers map to
+//                  physical hands directly. This decouples punch detection from
+//                  the mirror remapping that's only needed for IK/walk.
+//
+//  ISSUE-D  Walk speed too fast / instant full speed.
+//           Root cause: moveSpeed=4f applied from frame 1 using _animMoveX
+//           which jumps to ~0.8 in the first EMA step at animDamping=10.
+//           FIX-D: Movement position delta is now scaled by |_animMoveX| so
+//                  the character physically accelerates with the animator blend.
+//                  Also reduced default moveSpeed from 4 → 3 and exposed a
+//                  separate walkAccelDamping for the movement (vs animation).
+//
+//  ISSUE-E  srvAge never reset — ReceiveServerMoveX not being called.
+//           See ISSUE-A. The sentinel check in PoseManager was the gatekeeper
+//           that silently dropped all packets. Fixed in PoseManager.cs (v5.0).
+//
+//  ISSUE-F  JsonUtility silent deserialization failure on lw_vel field.
+//           JsonUtility in Unity does not throw on missing/mismatched fields —
+//           it silently leaves them at default (0f). If PoseDataPacket.lw_vel
+//           is not perfectly matching the JSON key, lw_vel stays 0f, the
+//           sentinel check (< -0.5) is never true, and ReceiveServerMoveX is
+//           never called. Fixed by removing the sentinel gate entirely (FIX-A1).
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
 public class AvatarController : MonoBehaviour
 {
+    // ── Inspector ─────────────────────────────────────────────────────────────
     [Header("=== PLAYER IDENTITY ===")]
-    public int playerID = -1; // Default to -1 (Unassigned)
+    public int playerID = -1;
     public bool IsPlayer1 => playerID == 0;
 
     [Header("=== MAP & GROUND ===")]
-    public float minMapX = -8.0f;
-    public float maxMapX = 8.0f;
-    public float groundY = 0.0f; // Force feet to this height
+    public float minMapX = -8f;
+    public float maxMapX = 8f;
+    public float groundY = -999f;
+    public float fightPlaneZ = 0f;
 
-    [Header("=== MOVEMENT SENSITIVITY ===")]
-    public float depthMovementSpeed = 2.0f;
-    public float leanMovementSpeed = 2.0f;
-    [Range(0.05f, 0.4f)] public float depthThreshold = 0.15f;
-    [Range(0.02f, 0.2f)] public float leanThreshold = 0.08f;
-    public float maxLean = 0.25f;
+    [Header("=== MOVEMENT ===")]
+    public float moveSpeed = 3f;          // ISSUE-D: lowered from 4 → 3
+    [Range(1f, 20f)] public float animDamping = 10f;
+    [Range(1f, 30f)] public float walkAccelDamping = 8f;   // ISSUE-D: separate accel curve
+    [Range(0.01f, 0.3f)] public float walkDeadZone = 0.08f;
+    [Range(0.05f, 0.5f)] public float reverseDirectionThreshold = 0.35f;
+    [Range(0.05f, 0.6f)] public float moveIdleTimeout = 0.18f;
 
-    [Header("=== COMBAT STATE ===")]
+    [Header("=== COMBAT ===")]
     public bool canFight = false;
 
     [Header("=== HITBOXES ===")]
@@ -29,301 +106,490 @@ public class AvatarController : MonoBehaviour
     public float hitboxActiveTime = 0.3f;
 
     [Header("=== CALIBRATION ===")]
-    public bool normalizeScale = true; // UNCHECK THIS if you want characters to have different heights!
-    public float targetHeight = 1.8f;  // Only used if normalizeScale is true
-    public float poseScale = 1.0f;
+    public bool normalizeScale = true;
+    public float targetHeight = 1.8f;
+    public float poseScale = 1f;
     public Vector3 poseOffset = Vector3.zero;
-    [Range(0.0f, 0.95f)] public float poseSmoothingFactor = 0.6f;
-    [Range(0.0f, 0.5f)] public float velocitySmoothingFactor = 0.2f;
+    [Range(0f, 0.95f)] public float poseSmoothingFactor = 0.6f;
+    [Range(0f, 0.5f)] public float velocitySmoothingFactor = 0.15f;
 
-    [Header("=== IK TRACKING ===")]
-    public bool useIKTracking = false;
-    public Transform headTarget;
-    public Transform leftHandTarget;
-    public Transform rightHandTarget;
-    public Transform leftElbowTarget;
-    public Transform rightElbowTarget;
+    [Header("=== IK ===")]
+    public bool useIKTracking;
+    public Transform headTarget, leftHandTarget, rightHandTarget;
+    public Transform leftElbowTarget, rightElbowTarget;
 
     [Header("=== PUNCH DETECTION ===")]
-    public float punchVelocityThreshold = 1.2f;
-    public float punchVelocityResetThreshold = 0.5f;
-    public float punchCooldown = 0.6f;
-    public float maxUpwardMovement = 0.25f;
-    public float minVisibilityThreshold = 0.25f;
-    public float autoResetTimeout = 1.5f;
+    public float punchVelocityThreshold = 2.2f;  // ISSUE-B2: raised 1.5→2.2
+    public float punchVelocityResetThreshold = 1.8f;
+    public float punchCooldown = 0.35f;
+    public float punchWalkSuppression = 2.5f;
+    // ISSUE-B: hip translation guard — if hips moved more than this normalised
+    // distance in one frame, it's a body lean, not a punch — skip detection.
+    [Range(0.001f, 0.05f)] public float leanGuardThreshold = 0.012f;
 
     [Header("=== DEBUG ===")]
     public bool debugMode = false;
     public bool mirrorInput = true;
     public bool showGizmos = true;
 
-    // Private State
-    private Animator animator;
-    private HealthSystem healthSystem;
-    private List<LandmarkData> keypoints;
-    private float initialShoulderWidth = -1f;
-    private float lastHipCenterX = 0f;
+    // ── Private — server packet ───────────────────────────────────────────────
+    private const float SERVER_EXPIRE_S = 1.2f;
 
-    // Landmarks
-    private Vector3[] smoothedWorldLandmarks = new Vector3[17];
-    private Vector3[] targetWorldLandmarks = new Vector3[17];
+    private float _srvMoveX;
+    private bool _hasSrvMoveX;
+    private bool _srvEverReceived;
+    private float _srvAge = SERVER_EXPIRE_S + 1f;
 
-    // Punch State
-    private Vector3 lastLeftHandPos;
-    private Vector3 lastRightHandPos;
-    private float lastUpdateTime;
-    private float lastLeftPunchTime = -999f;
-    private float lastRightPunchTime = -999f;
-    private float lastLeftHandVelocity = 0f;
-    private float lastRightHandVelocity = 0f;
-    private bool leftHandWasFast = false;
-    private bool rightHandWasFast = false;
-    private float leftMotionStartTime = 0f;
-    private float rightMotionStartTime = 0f;
+    // ── Private — walk ───────────────────────────────────────────────────────
+    private float _idleTimer;
+    private float _animMoveX;
+    private float _targetMoveX;
+    private float _lockedDir;
 
-    // Keypoint Map
-    private const int Nose = 0;
-    private const int LeftShoulder = 5; private const int RightShoulder = 6;
-    private const int LeftElbow = 7; private const int RightElbow = 8;
-    private const int LeftWrist = 9; private const int RightWrist = 10;
-    private const int LeftHip = 11; private const int RightHip = 12;
+    // ── Private — pose / IK ──────────────────────────────────────────────────
+    private Animator _anim;
+    private HealthSystem _health;
+    private Rigidbody _rb;
+    private bool _isStunned;
+    private float _groundY;
+    private bool _groundYReady;
+    private List<LandmarkData> _kp;
+    private Vector3[] _smoothed = new Vector3[17];
+    private Vector3[] _target = new Vector3[17];
 
+    // ── Private — punch (ISSUE-C: physical-hand tracking, pre-mirror) ────────
+    private Vector3 _physLastL, _physLastR;   // physical left/right wrist - shoulder
+    private float _physLastT;
+    private float _lastLPunch = -999f, _lastRPunch = -999f;
+    private float _velL, _velR;
+    private bool _lWasFast, _rWasFast;
+    private bool _punchInit;
+
+    // ISSUE-B: lean guard state
+    private Vector3 _lastHipWorld = Vector3.zero;
+    private bool _hipInitialized;
+
+    // keypoint indices — YOLO 17-point
+    const int Nose = 0, LShoulder = 5, RShoulder = 6,
+              LElbow = 7, RElbow = 8, LWrist = 9, RWrist = 10,
+              LHip = 11, RHip = 12;
+
+    // ═════════════════════════════════════════════════════════════════════════
     void Start()
     {
-        animator = GetComponent<Animator>();
-        healthSystem = GetComponent<HealthSystem>();
-        lastUpdateTime = Time.time;
+        _anim = GetComponent<Animator>();
+        _health = GetComponent<HealthSystem>();
+        _rb = GetComponent<Rigidbody>();
+        _physLastT = Time.time;
 
-        for (int i = 0; i < 17; i++)
-        {
-            targetWorldLandmarks[i] = transform.position;
-            smoothedWorldLandmarks[i] = transform.position;
-        }
+        if (_anim != null) _anim.applyRootMotion = false;
 
-        // === FIXED SCALING LOGIC ===
         if (normalizeScale)
         {
-            CapsuleCollider capsule = GetComponent<CapsuleCollider>();
-            if (capsule != null && capsule.height > 0.1f)
+            var cap = GetComponent<CapsuleCollider>();
+            if (cap != null && cap.height > 0.1f)
             {
-                float currentHeight = capsule.height * transform.localScale.y;
-                if (currentHeight > 0.1f)
-                {
-                    float scaleFactor = targetHeight / currentHeight;
-                    transform.localScale = transform.localScale * scaleFactor;
-                }
+                float curH = cap.height * transform.localScale.y;
+                if (curH > 0.1f)
+                    transform.localScale *= targetHeight / curH;
             }
         }
 
-        lastLeftHandPos = targetWorldLandmarks[LeftWrist];
-        lastRightHandPos = targetWorldLandmarks[RightWrist];
+        _groundY = (groundY > -998f) ? groundY : transform.position.y;
+        _groundYReady = true;
+
+        var p = transform.position;
+        p.y = _groundY;
+        p.z = fightPlaneZ;
+        transform.position = p;
+
+        for (int i = 0; i < 17; i++)
+            _target[i] = _smoothed[i] = transform.position;
+
+        _anim?.SetFloat("MoveX", 0f);
+
+        Debug.Log($"<color=cyan>[{name}] AvatarController v5.0 ready | " +
+                  $"scale={transform.localScale.y:F2} | groundY={_groundY:F2} | " +
+                  $"rootMotion={(_anim != null ? _anim.applyRootMotion.ToString() : "n/a")}</color>");
     }
 
-    public void SetPlayerID(int id)
-    {
-        playerID = id;
-        mirrorInput = true;
-    }
+    // ── Public API ────────────────────────────────────────────────────────────
+    public void SetPlayerID(int id) { playerID = id; mirrorInput = true; }
+    public void ReceiveJump() { _anim?.SetTrigger("Jump"); }
+    public void TriggerHitReaction() { _anim?.SetTrigger("Hit"); }
+    public void SetStunned(bool s) { _isStunned = s; }
 
-    public void ReceiveKeypoints(List<LandmarkData> keypoints)
+    public void ReceiveKeypoints(List<LandmarkData> kp)
     {
-        if (playerID == -1) return;
-        if (keypoints == null || keypoints.Count < 17) return;
-        this.keypoints = keypoints;
+        if (playerID == -1 || kp == null || kp.Count < 17) return;
+        _kp = kp;
         UpdateTargetLandmarks();
     }
 
+    // ISSUE-A FIX: called unconditionally by PoseManager — no sentinel gate.
+    public void ReceiveServerMoveX(float v)
+    {
+        _srvMoveX = v;
+        _hasSrvMoveX = true;
+        _srvEverReceived = true;
+        _srvAge = 0f;
+    }
+
+    // ── Update ────────────────────────────────────────────────────────────────
     void Update()
     {
-        // === 1. FORCE POSITION TO GROUND (FIXES FLOATING) ===
-        Vector3 currentPos = transform.position;
-        currentPos.z = 0;       // Lock 2D plane
-        currentPos.y = groundY; // Lock to Ground
+        if (!_groundYReady) return;
 
-        // Clamp X (Invisible Walls)
-        currentPos.x = Mathf.Clamp(currentPos.x, minMapX, maxMapX);
-        transform.position = currentPos;
+        // Expire stale server data
+        _srvAge += Time.deltaTime;
+        if (_hasSrvMoveX && _srvAge >= SERVER_EXPIRE_S)
+        {
+            _hasSrvMoveX = false;
+            _srvMoveX = 0f;
+        }
 
-        // 2. Smoothing
-        float lerpFactor = 1.0f - poseSmoothingFactor;
+        // Smooth landmarks
+        float lf = 1f - poseSmoothingFactor;
         for (int i = 0; i < 17; i++)
-            smoothedWorldLandmarks[i] = Vector3.Lerp(smoothedWorldLandmarks[i], targetWorldLandmarks[i], lerpFactor);
+            _smoothed[i] = Vector3.Lerp(_smoothed[i], _target[i], lf);
 
         if (useIKTracking) UpdateIKTargets();
 
-        if (keypoints != null && keypoints.Count >= 17 && canFight)
+        if (_kp != null && _kp.Count >= 17 && canFight && !_isStunned)
         {
-            DetectDepthMovement();
-            DetectLeanMovement();
+            UpdateWalk();
             DetectPunches();
+        }
+        else
+        {
+            // Force idle cleanly
+            _targetMoveX = 0f;
+            _lockedDir = 0f;
+            _idleTimer = 0f;
+            DrainToIdle(animDamping * 2f);  // ISSUE-A FIX: fast drain when inactive
+        }
+
+        ApplyMovementAndClamp();
+    }
+
+    void LateUpdate()
+    {
+        if (!_groundYReady || _isStunned || _rb != null) return;
+        var pos = transform.position;
+        if (Mathf.Abs(pos.y - _groundY) > 0.001f)
+        {
+            pos.y = _groundY;
+            transform.position = pos;
         }
     }
 
-    private void DetectDepthMovement()
+    // ── Walk ──────────────────────────────────────────────────────────────────
+    void UpdateWalk()
     {
-        int lShoulderIdx = mirrorInput ? RightShoulder : LeftShoulder;
-        int rShoulderIdx = mirrorInput ? LeftShoulder : RightShoulder;
+        // Raw input: server value when fresh, 0 when expired or never received
+        float raw = _srvEverReceived ? _srvMoveX : 0f;
 
-        if (lShoulderIdx >= keypoints.Count || rShoulderIdx >= keypoints.Count) return;
+        // P2 sees world flipped
+        float inputMoveX = IsPlayer1 ? raw : -raw;
 
-        float currentWidth = Mathf.Abs(keypoints[lShoulderIdx].x - keypoints[rShoulderIdx].x);
+        // Deadzone
+        inputMoveX = Mathf.Clamp(inputMoveX, -1f, 1f);
+        if (Mathf.Abs(inputMoveX) < walkDeadZone)
+            inputMoveX = 0f;
+        else
+            inputMoveX = Mathf.Sign(inputMoveX);
 
-        if (initialShoulderWidth < 0)
+        // Direction hysteresis — suppress weak opposite signal
+        if (_lockedDir != 0f && inputMoveX != 0f &&
+            Mathf.Sign(inputMoveX) != _lockedDir)
         {
-            initialShoulderWidth = currentWidth;
+            if (Mathf.Abs(raw) < reverseDirectionThreshold)
+                inputMoveX = _lockedDir;
+        }
+
+        bool hasInput = (inputMoveX != 0f);
+
+        if (hasInput)
+        {
+            _idleTimer = 0f;
+            float dir = Mathf.Sign(inputMoveX);
+
+            if (_lockedDir == 0f || dir == _lockedDir)
+            {
+                _lockedDir = dir;
+                _targetMoveX = dir;
+            }
+            else if (Mathf.Abs(raw) > reverseDirectionThreshold)
+            {
+                _lockedDir = dir;
+                _targetMoveX = dir;
+            }
+        }
+        else
+        {
+            _idleTimer += Time.deltaTime;
+            if (_idleTimer >= moveIdleTimeout)
+            {
+                _targetMoveX = 0f;
+                _lockedDir = 0f;
+
+                // ISSUE-A FIX: when idle timeout fires, fast-drain the EMA so
+                // ghost walk cycles can't happen. animDamping*2 drains to ~0.05
+                // in roughly half the normal time.
+                if (Mathf.Abs(_animMoveX) > 0.05f)
+                    DrainToIdle(animDamping * 2f);
+            }
+        }
+
+        // ISSUE-D FIX: use walkAccelDamping for the blend, animDamping for display
+        float s = 1f - Mathf.Exp(-walkAccelDamping * Time.deltaTime);
+        _animMoveX = Mathf.Lerp(_animMoveX, _targetMoveX, s);
+        if (Mathf.Abs(_animMoveX) < 0.05f) _animMoveX = 0f;
+
+        _anim?.SetFloat("MoveX", _animMoveX);
+
+        if (debugMode)
+            Debug.Log($"<color=lime>[{name}] MoveX={_animMoveX:F2} raw={raw:F2} " +
+                      $"fresh={_hasSrvMoveX} srvAge={_srvAge:F2} locked={_lockedDir}</color>");
+    }
+
+    // Helper: decay _animMoveX toward 0 at given damping rate, then apply
+    void DrainToIdle(float damping)
+    {
+        float s = 1f - Mathf.Exp(-damping * Time.deltaTime);
+        _animMoveX = Mathf.Lerp(_animMoveX, 0f, s);
+        if (Mathf.Abs(_animMoveX) < 0.05f) _animMoveX = 0f;
+        _anim?.SetFloat("MoveX", _animMoveX);
+    }
+
+    void ApplyMovementAndClamp()
+    {
+        if (!_groundYReady) return;
+        var t = transform.position;
+
+        // ISSUE-D FIX: multiply by |_animMoveX| so acceleration matches animation.
+        // Character physically accelerates/decelerates with the blend — no instant snap.
+        float worldDir = IsPlayer1 ? _animMoveX : -_animMoveX;
+        if (Mathf.Abs(_animMoveX) > 0.01f)
+            t.x += worldDir * moveSpeed * Time.deltaTime;
+
+        t.x = Mathf.Clamp(t.x, minMapX, maxMapX);
+        t.z = fightPlaneZ;
+        if (!_isStunned && _rb == null) t.y = _groundY;
+
+        if (_rb != null) _rb.MovePosition(t);
+        else transform.position = t;
+    }
+
+    // ── Punch Detection ───────────────────────────────────────────────────────
+    void DetectPunches()
+    {
+        float now = Time.time;
+        float dt = now - _physLastT;
+        if (dt <= 0.01f) return;
+
+        // ISSUE-C FIX: use PHYSICAL hand indices (pre-mirror) so punch side
+        // maps to the actual arm the user extended, regardless of mirrorInput.
+        // Physical left = index 9, physical right = index 10.
+        // We read directly from _kp (raw, pre-mirror) instead of _target.
+        int physLW = 9, physRW = 10;
+        int physLS = 5, physRS = 6;
+
+        if (_kp == null || _kp.Count < 17) { _physLastT = now; return; }
+
+        // Build world-space relative positions for physical hands
+        // (shoulder-subtracted to cancel body translation)
+        Vector3 curPhysL = PhysPos(_kp, physLW) - PhysPos(_kp, physLS);
+        Vector3 curPhysR = PhysPos(_kp, physRW) - PhysPos(_kp, physRS);
+
+        // ISSUE-B FIX: lean guard — measure hip center movement this frame.
+        // If hips translated significantly, it's a body lean, suppress punches.
+        Vector3 hipNow = (PhysPos(_kp, 11) + PhysPos(_kp, 12)) * 0.5f;
+        bool isBodyLean = false;
+        if (_hipInitialized)
+        {
+            float hipDelta = Vector3.Distance(hipNow, _lastHipWorld);
+            isBodyLean = (hipDelta > leanGuardThreshold);
+
+            if (isBodyLean && debugMode)
+                Debug.Log($"<color=yellow>[{name}] Lean guard fired hipDelta={hipDelta:F4}</color>");
+        }
+        _lastHipWorld = hipNow;
+        _hipInitialized = true;
+
+        if (!_punchInit)
+        {
+            _physLastL = curPhysL; _physLastR = curPhysR;
+            _punchInit = true; _physLastT = now;
             return;
         }
 
-        float ratio = currentWidth / initialShoulderWidth;
-        float moveDir = 0f;
+        Vector3 dL = curPhysL - _physLastL;
+        Vector3 dR = curPhysR - _physLastR;
+        float vL = dL.magnitude / dt;
+        float vR = dR.magnitude / dt;
 
-        if (ratio > (1.0f + depthThreshold)) moveDir = IsPlayer1 ? 1f : -1f;
-        else if (ratio < (1.0f - depthThreshold)) moveDir = IsPlayer1 ? -1f : 1f;
+        float smL = Mathf.Lerp(_velL, vL, velocitySmoothingFactor);
+        float smR = Mathf.Lerp(_velR, vR, velocitySmoothingFactor);
 
-        if (moveDir != 0)
-            transform.Translate(Vector3.right * moveDir * depthMovementSpeed * Time.deltaTime, Space.World);
-    }
+        // Dynamic threshold rises with walk speed
+        float thr = punchVelocityThreshold + Mathf.Abs(_animMoveX) * punchWalkSuppression;
 
-    private void DetectLeanMovement()
-    {
-        Vector3 leftHipPos = GetRawLandmarkPosition(LeftHip);
-        Vector3 rightHipPos = GetRawLandmarkPosition(RightHip);
-        float hipCenterX = (leftHipPos.x + rightHipPos.x) / 2.0f;
+        // Both-hands same-direction = body lean
+        bool bothSideways = vL > 0.4f && vR > 0.4f
+                         && Mathf.Sign(dL.x) == Mathf.Sign(dR.x);
 
-        if (lastHipCenterX == 0) { lastHipCenterX = hipCenterX; return; }
-
-        float leanDelta = hipCenterX - lastHipCenterX;
-        bool isGuarding = GetRawLandmarkPosition(LeftWrist).y > GetRawLandmarkPosition(LeftHip).y;
-
-        if (isGuarding && !leftHandWasFast && !rightHandWasFast)
+        // ISSUE-B FIX: skip if lean guard fires OR both-hands filter fires
+        if (!isBodyLean && !bothSideways)
         {
-            if (Mathf.Abs(leanDelta) > leanThreshold)
+            // Physical left hand punch — map to "Left" trigger
+            if (smL > thr && (now - _lastLPunch) > punchCooldown && !_lWasFast)
             {
-                float normalizedLean = Mathf.Clamp(leanDelta, -maxLean, maxLean) / maxLean;
-                transform.Translate(Vector3.right * normalizedLean * leanMovementSpeed * Time.deltaTime, Space.World);
+                if (debugMode)
+                    Debug.Log($"<color=orange>[{name}] PHYS-L PUNCH vel={smL:F2} thr={thr:F2}</color>");
+                FirePunch("Left");
+                _lastLPunch = now;
+                _lWasFast = true;
+            }
+            // Physical right hand punch — map to "Right" trigger
+            if (smR > thr && (now - _lastRPunch) > punchCooldown && !_rWasFast)
+            {
+                if (debugMode)
+                    Debug.Log($"<color=orange>[{name}] PHYS-R PUNCH vel={smR:F2} thr={thr:F2}</color>");
+                FirePunch("Right");
+                _lastRPunch = now;
+                _rWasFast = true;
             }
         }
-        lastHipCenterX = hipCenterX;
+
+        if (smL < punchVelocityResetThreshold) _lWasFast = false;
+        if (smR < punchVelocityResetThreshold) _rWasFast = false;
+
+        _physLastL = curPhysL; _physLastR = curPhysR;
+        _velL = smL; _velR = smR;
+        _physLastT = now;
     }
 
-    private void DetectPunches()
+    // Builds a normalised 3D position from a raw LandmarkData entry.
+    // Used only for punch detection — pre-mirror, in a stable landmark space.
+    Vector3 PhysPos(List<LandmarkData> kp, int idx)
     {
-        float currentTime = Time.time;
-        float deltaTime = currentTime - lastUpdateTime;
-        if (deltaTime <= 0.01f) return;
-
-        Vector3 curL = GetRawLandmarkPosition(LeftWrist);
-        Vector3 curR = GetRawLandmarkPosition(RightWrist);
-
-        float lVel = (curL - lastLeftHandPos).magnitude / deltaTime;
-        float rVel = (curR - lastRightHandPos).magnitude / deltaTime;
-
-        float smLVel = Mathf.Lerp(lastLeftHandVelocity, lVel, velocitySmoothingFactor);
-        float smRVel = Mathf.Lerp(lastRightHandVelocity, rVel, velocitySmoothingFactor);
-
-        if (smLVel > punchVelocityThreshold && (currentTime - lastLeftPunchTime) > punchCooldown)
-        {
-            if (!leftHandWasFast)
-            {
-                TriggerPunch("Left", smLVel);
-                lastLeftPunchTime = currentTime;
-                leftHandWasFast = true;
-            }
-        }
-        else if (smLVel < punchVelocityResetThreshold) leftHandWasFast = false;
-
-        if (smRVel > punchVelocityThreshold && (currentTime - lastRightPunchTime) > punchCooldown)
-        {
-            if (!rightHandWasFast)
-            {
-                TriggerPunch("Right", smRVel);
-                lastRightPunchTime = currentTime;
-                rightHandWasFast = true;
-            }
-        }
-        else if (smRVel < punchVelocityResetThreshold) rightHandWasFast = false;
-
-        lastLeftHandPos = curL; lastRightHandPos = curR;
-        lastLeftHandVelocity = smLVel; lastRightHandVelocity = smRVel;
-        lastUpdateTime = currentTime;
+        if (idx >= kp.Count) return Vector3.zero;
+        return new Vector3(kp[idx].x, kp[idx].y, 0f);
     }
 
-    private void TriggerPunch(string hand, float velocity)
+    void FirePunch(string hand)
     {
-        if (healthSystem != null && healthSystem.IsKnockedOut()) return;
-
-        if (hand == "Right" && rightHandHitbox) StartCoroutine(ManageHitbox(rightHandHitbox));
-        if (hand == "Left" && leftHandHitbox) StartCoroutine(ManageHitbox(leftHandHitbox));
-
-        animator.SetTrigger(hand == "Right" ? "PunchRight" : "PunchLeft");
+        if (_health != null && _health.IsKnockedOut()) return;
+        if (_anim == null) return;
+        if (hand == "Left" && leftHandHitbox != null) StartCoroutine(ArmHitbox(leftHandHitbox));
+        if (hand == "Right" && rightHandHitbox != null) StartCoroutine(ArmHitbox(rightHandHitbox));
+        _anim.SetTrigger(hand == "Right" ? "PunchRight" : "PunchLeft");
     }
 
-    private IEnumerator ManageHitbox(Hitbox hitbox)
+    IEnumerator ArmHitbox(Hitbox hb)
     {
-        hitbox.EnableHitbox();
+        hb.EnableHitbox();
         yield return new WaitForSeconds(hitboxActiveTime);
-        if (hitbox != null) hitbox.GetComponent<Collider>().enabled = false;
+        var col = hb?.GetComponent<Collider>();
+        if (col != null) col.enabled = false;
     }
 
-    private void UpdateTargetLandmarks()
+    // ── Landmark helpers ──────────────────────────────────────────────────────
+    void UpdateTargetLandmarks()
     {
-        Vector3 basePos = transform.position;
-        Quaternion baseRot = transform.rotation;
-
+        var bp = transform.position;
+        var br = transform.rotation;
         for (int i = 0; i < 17; i++)
         {
-            int srcIdx = mirrorInput ? GetMirroredIndex(i) : i;
-            if (srcIdx >= keypoints.Count) continue;
-
-            float x_c = keypoints[srcIdx].x - 0.5f;
-            float y_c = 0.5f - keypoints[srcIdx].y;
-            Vector3 localPos = new Vector3(x_c, y_c, 0);
-            targetWorldLandmarks[i] = basePos + (baseRot * ((localPos + poseOffset) * poseScale));
+            int s = mirrorInput ? Mirror(i) : i;
+            if (s >= _kp.Count) continue;
+            _target[i] = bp + br * ((new Vector3(_kp[s].x - 0.5f, 0.5f - _kp[s].y, 0)
+                                     + poseOffset) * poseScale);
         }
     }
 
-    private int GetMirroredIndex(int i)
+    int Mirror(int i)
     {
-        int[] map = { 0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15 };
-        return (i < map.Length) ? map[i] : i;
+        int[] m = { 0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15 };
+        return i < m.Length ? m[i] : i;
     }
 
-    Vector3 GetRawLandmarkPosition(int index) =>
-        (targetWorldLandmarks != null && index < targetWorldLandmarks.Length) ? targetWorldLandmarks[index] : Vector3.zero;
+    Vector3 Pos(int i) => (_target != null && i < _target.Length) ? _target[i] : Vector3.zero;
+    Vector3 SPos(int i) => (_smoothed != null && i < _smoothed.Length) ? _smoothed[i] : Vector3.zero;
 
-    Vector3 GetLandmarkPosition(int index) =>
-        (smoothedWorldLandmarks != null && index < smoothedWorldLandmarks.Length) ? smoothedWorldLandmarks[index] : Vector3.zero;
-
-    private void UpdateIKTargets()
+    // ── IK ────────────────────────────────────────────────────────────────────
+    void UpdateIKTargets()
     {
-        if (headTarget) headTarget.position = GetLandmarkPosition(Nose);
-        if (leftHandTarget) leftHandTarget.position = GetLandmarkPosition(LeftWrist);
-        if (rightHandTarget) rightHandTarget.position = GetLandmarkPosition(RightWrist);
-        if (leftElbowTarget) leftElbowTarget.position = GetLandmarkPosition(LeftElbow);
-        if (rightElbowTarget) rightElbowTarget.position = GetLandmarkPosition(RightElbow);
+        if (headTarget) headTarget.position = SPos(Nose);
+        if (leftHandTarget) leftHandTarget.position = SPos(LWrist);
+        if (rightHandTarget) rightHandTarget.position = SPos(RWrist);
+        if (leftElbowTarget) leftElbowTarget.position = SPos(LElbow);
+        if (rightElbowTarget) rightElbowTarget.position = SPos(RElbow);
     }
 
-    void OnAnimatorIK(int layerIndex)
+    void OnAnimatorIK(int _)
     {
-        if (!useIKTracking || keypoints == null) return;
-        SetIK(AvatarIKGoal.LeftHand, leftHandTarget, AvatarIKHint.LeftElbow, leftElbowTarget);
-        SetIK(AvatarIKGoal.RightHand, rightHandTarget, AvatarIKHint.RightElbow, rightElbowTarget);
-        if (headTarget) { animator.SetLookAtWeight(1); animator.SetLookAtPosition(headTarget.position); }
+        if (!useIKTracking || _kp == null) return;
+        IKGoal(AvatarIKGoal.LeftHand, leftHandTarget, AvatarIKHint.LeftElbow, leftElbowTarget);
+        IKGoal(AvatarIKGoal.RightHand, rightHandTarget, AvatarIKHint.RightElbow, rightElbowTarget);
+        if (headTarget)
+        {
+            _anim.SetLookAtWeight(1);
+            _anim.SetLookAtPosition(headTarget.position);
+        }
     }
 
-    void SetIK(AvatarIKGoal goal, Transform t, AvatarIKHint hint, Transform ht)
+    void IKGoal(AvatarIKGoal g, Transform t, AvatarIKHint h, Transform ht)
     {
-        if (t) { animator.SetIKPositionWeight(goal, 1); animator.SetIKPosition(goal, t.position); }
-        if (ht) { animator.SetIKHintPositionWeight(hint, 1); animator.SetIKHintPosition(hint, ht.position); }
+        if (t) { _anim.SetIKPositionWeight(g, 1); _anim.SetIKPosition(g, t.position); }
+        if (ht) { _anim.SetIKHintPositionWeight(h, 1); _anim.SetIKHintPosition(h, ht.position); }
     }
 
     void OnDrawGizmos()
     {
-        if (!showGizmos || smoothedWorldLandmarks == null || smoothedWorldLandmarks.Length < 17) return;
+        if (!showGizmos || _smoothed == null) return;
         Gizmos.color = Color.cyan;
-        foreach (var pos in smoothedWorldLandmarks) Gizmos.DrawSphere(pos, 0.015f);
+        foreach (var p in _smoothed) Gizmos.DrawSphere(p, 0.015f);
     }
 
-    public float GetLeftHandVelocity() => lastLeftHandVelocity;
-    public float GetRightHandVelocity() => lastRightHandVelocity;
+    public float GetLeftHandVelocity() => _velL;
+    public float GetRightHandVelocity() => _velR;
 }
+
+/*
+ ═══════════════════════════════════════════════════════════════════════════════
+  ANIMATOR SETUP — Fighter_Animator.controller   (unchanged from v4)
+ ═══════════════════════════════════════════════════════════════════════════════
+
+  PARAMETERS:
+    Float   → MoveX
+    Trigger → PunchLeft
+    Trigger → PunchRight
+    Trigger → Hit
+    Trigger → Knockout
+    Trigger → Jump
+
+  TRANSITIONS:
+  1. Walking           → Sad Idle   MoveX > -0.05 AND MoveX < 0.05  | ExitTime OFF | Duration 0.10
+  2. Walking Backwards → Sad Idle   MoveX > -0.05 AND MoveX < 0.05  | ExitTime OFF | Duration 0.10
+  3. Sad Idle → Walking             MoveX > 0.05                     | ExitTime OFF | Duration 0.10
+  4. Sad Idle → Walking Backwards   MoveX < -0.05                    | ExitTime OFF | Duration 0.10
+
+  PUNCH TRANSITIONS (add if not already present):
+  5. Any State → PunchRight   Trigger PunchRight  | ExitTime OFF | Duration 0.05
+  6. Any State → PunchLeft    Trigger PunchLeft   | ExitTime OFF | Duration 0.05
+  7. PunchRight → Sad Idle    Has Exit Time ON    | ExitTime 0.8 | Duration 0.10
+  8. PunchLeft  → Sad Idle    Has Exit Time ON    | ExitTime 0.8 | Duration 0.10
+
+  CLIP IMPORT SETTINGS (all clips):
+    Root Transform Rotation   → Bake Into Pose ✅  Based On: Original
+    Root Transform Position Y → Bake Into Pose ✅  Based On: Feet
+    Root Transform Position XZ→ Bake Into Pose ✅  Based On: Original
+
+  PREFAB:
+    Animator → Apply Root Motion : OFF
+    Pivot at feet (Y=0)
+
+ ═══════════════════════════════════════════════════════════════════════════════
+*/

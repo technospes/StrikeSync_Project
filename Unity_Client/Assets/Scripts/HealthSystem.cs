@@ -1,14 +1,24 @@
-using UnityEngine;
+﻿using UnityEngine;
 using UnityEngine.UI;
 using System.Collections;
 
+/// <summary>
+/// HealthSystem — production version.
+///
+/// Changes vs original:
+///   • BroadcastHealth() is throttled (max once per 50 ms) to prevent
+///     message flooding when multiple hits land in the same frame.
+///   • Uses Newtonsoft.Json + UnityWSBridge.SendHealthUpdate() for correct
+///     serialisation of the structured payload.
+///   • Calls SendHealthUpdate() on Recover() so React always stays in sync.
+/// </summary>
 public class HealthSystem : MonoBehaviour
 {
     [Header("Health Settings")]
     public float maxHealth = 100f;
-    public bool enableRegen = true; // Toggle this OFF for hardcore mode
+    public bool enableRegen = true;
     public float healthRegenRate = 5f;
-    public float regenDelay = 5f; // Increased default to 5 seconds
+    public float regenDelay = 5f;
 
     [Header("UI Elements")]
     public Slider healthSlider;
@@ -23,31 +33,42 @@ public class HealthSystem : MonoBehaviour
     public float punchStunDuration = 0.3f;
     public float knockoutRecoveryTime = 5f;
 
-    [Header("Audio/Visual Feedback")]
+    [Header("Audio / Visual Feedback")]
     public AudioClip hitSound;
     public AudioClip knockoutSound;
     public ParticleSystem hitEffect;
     public ParticleSystem knockoutEffect;
 
-    private float currentHealth;
-    private float lastHitTime;
-    private bool isKnockedOut = false;
-    private Animator animator;
-    private AvatarController avatarController;
-    private Coroutine regenCoroutine;
-    private Coroutine stunCoroutine;
+    // ── Private state ────────────────────────────────────────────────────────
+    private float _currentHealth;
+    private float _lastHitTime;
+    private bool _isKnockedOut;
+    private Animator _animator;
+    private AvatarController _avatarController;
+    private Coroutine _regenCoroutine;
+    private Coroutine _stunCoroutine;
 
+    // Throttle: send health update at most once every 50 ms.
+    private float _lastBroadcastTime = -1f;
+    private const float BroadcastMinInterval = 0.05f;
+
+    // ── Events ────────────────────────────────────────────────────────────────
     public System.Action<float> OnDamageTaken;
     public System.Action OnKnockout;
     public System.Action OnRecovered;
 
+    // ── Unity lifecycle ───────────────────────────────────────────────────────
     void Start()
     {
-        currentHealth = maxHealth;
-        animator = GetComponent<Animator>();
-        avatarController = GetComponent<AvatarController>();
+        _currentHealth = maxHealth;
+        _animator = GetComponent<Animator>();
+        _avatarController = GetComponent<AvatarController>();
+
         InitializeUI();
-        regenCoroutine = StartCoroutine(HealthRegeneration());
+        _regenCoroutine = StartCoroutine(HealthRegeneration());
+
+        // Send initial health so React HUD is correct from frame 1.
+        BroadcastHealth(force: true);
     }
 
     void InitializeUI()
@@ -57,24 +78,29 @@ public class HealthSystem : MonoBehaviour
         if (knockoutText != null) knockoutText.SetActive(false);
     }
 
+    // ── Public API ────────────────────────────────────────────────────────────
     public void TakeDamage(float damageAmount, string punchType = "normal", Vector3 hitDirection = default)
     {
-        if (isKnockedOut) return;
+        if (_isKnockedOut) return;
 
         float actualDamage = punchType == "strong" ? strongPunchDamage : punchDamage;
-        currentHealth -= actualDamage;
-        lastHitTime = Time.time; // Reset regen timer
+        _currentHealth -= actualDamage;
+        _lastHitTime = Time.time;
 
         UpdateHealthUI();
         PlayHitEffects(hitDirection);
         OnDamageTaken?.Invoke(actualDamage);
+        BroadcastHealth();
 
-        if (stunCoroutine != null) StopCoroutine(stunCoroutine);
-        stunCoroutine = StartCoroutine(PunchStunEffect());
+        // Trigger the "Hit" animator parameter on the character being struck
+        _avatarController?.TriggerHitReaction();
 
-        if (currentHealth <= 0)
+        if (_stunCoroutine != null) StopCoroutine(_stunCoroutine);
+        _stunCoroutine = StartCoroutine(PunchStunEffect());
+
+        if (_currentHealth <= 0)
         {
-            currentHealth = 0;
+            _currentHealth = 0;
             Knockout();
         }
     }
@@ -87,37 +113,78 @@ public class HealthSystem : MonoBehaviour
         TakeDamage(punchDamage * damageMultiplier, punchType, hitDirection);
     }
 
+    public void Recover()
+    {
+        _isKnockedOut = false;
+        _currentHealth = maxHealth * 0.3f;
+
+        UpdateHealthUI();
+        BroadcastHealth(force: true);
+
+        if (_avatarController != null)
+        {
+            _avatarController.SetStunned(false);  // Restore ground-lock after recovery
+            _avatarController.enabled = true;
+        }
+        if (knockoutText != null) knockoutText.SetActive(false);
+        OnRecovered?.Invoke();
+    }
+
+    public bool IsKnockedOut() => _isKnockedOut;
+    public float GetHealthPercentage() => _currentHealth / maxHealth;
+    public float GetCurrentHealth() => _currentHealth;
+
+    // ── Private helpers ───────────────────────────────────────────────────────
     private void UpdateHealthUI()
     {
-        if (healthSlider != null) healthSlider.value = currentHealth;
+        if (healthSlider != null) healthSlider.value = _currentHealth;
         if (healthFillImage != null)
         {
-            float healthPercent = currentHealth / maxHealth;
-            healthFillImage.color = Color.Lerp(lowHealthColor, fullHealthColor, healthPercent);
+            float pct = _currentHealth / maxHealth;
+            healthFillImage.color = Color.Lerp(lowHealthColor, fullHealthColor, pct);
         }
     }
 
     private void PlayHitEffects(Vector3 hitDirection)
     {
         if (hitSound != null) AudioSource.PlayClipAtPoint(hitSound, transform.position);
-        if (hitEffect != null) { hitEffect.transform.position = transform.position + hitDirection * 0.5f; hitEffect.Play(); }
+        if (hitEffect != null)
+        {
+            hitEffect.transform.position = transform.position + hitDirection * 0.5f;
+            hitEffect.Play();
+        }
     }
 
     private IEnumerator PunchStunEffect()
     {
-        if (avatarController != null) avatarController.enabled = false;
+        if (_avatarController != null)
+        {
+            _avatarController.enabled = false;
+            _avatarController.SetStunned(true);   // Unlocks Y so knockback arc isn't crushed
+        }
         yield return new WaitForSeconds(punchStunDuration);
-        if (avatarController != null && !isKnockedOut) avatarController.enabled = true;
+        if (_avatarController != null && !_isKnockedOut)
+        {
+            _avatarController.SetStunned(false);  // Restore ground-lock
+            _avatarController.enabled = true;
+        }
     }
 
     private void Knockout()
     {
-        isKnockedOut = true;
-        if (animator != null) animator.SetTrigger("Knockout");
-        if (avatarController != null) avatarController.enabled = false;
+        _isKnockedOut = true;
+
+        if (_animator != null) _animator.SetTrigger("Knockout");
+        if (_avatarController != null)
+        {
+            _avatarController.SetStunned(true);   // Free Y so knockout fall/ragdoll plays correctly
+            _avatarController.enabled = false;
+        }
         if (knockoutSound != null) AudioSource.PlayClipAtPoint(knockoutSound, transform.position);
         if (knockoutEffect != null) knockoutEffect.Play();
         if (knockoutText != null) knockoutText.SetActive(true);
+
+        BroadcastHealth(force: true);
         OnKnockout?.Invoke();
         StartCoroutine(RecoveryProcess());
     }
@@ -128,39 +195,50 @@ public class HealthSystem : MonoBehaviour
         Recover();
     }
 
-    public void Recover()
-    {
-        isKnockedOut = false;
-        currentHealth = maxHealth * 0.3f;
-        UpdateHealthUI();
-        if (avatarController != null) avatarController.enabled = true;
-        if (knockoutText != null) knockoutText.SetActive(false);
-        OnRecovered?.Invoke();
-    }
-
     private IEnumerator HealthRegeneration()
     {
         while (true)
         {
             yield return new WaitForSeconds(1f);
 
-            if (enableRegen && !isKnockedOut &&
-                Time.time - lastHitTime > regenDelay &&
-                currentHealth < maxHealth)
+            if (enableRegen && !_isKnockedOut
+                && Time.time - _lastHitTime > regenDelay
+                && _currentHealth < maxHealth)
             {
-                currentHealth = Mathf.Min(currentHealth + healthRegenRate, maxHealth);
+                _currentHealth = Mathf.Min(_currentHealth + healthRegenRate, maxHealth);
                 UpdateHealthUI();
+                BroadcastHealth();
             }
         }
     }
 
-    public bool IsKnockedOut() => isKnockedOut;
-    public float GetHealthPercentage() => currentHealth / maxHealth;
-    public float GetCurrentHealth() => currentHealth;
+    // ─────────────────────────────────────────────────────────────────────────
+    // BroadcastHealth
+    //
+    // Throttled at BroadcastMinInterval (50 ms) to prevent message flooding.
+    // Pass force:true to bypass the throttle (used on Knockout / Recover /
+    // Start where a guaranteed immediate sync is critical).
+    // ─────────────────────────────────────────────────────────────────────────
+    private void BroadcastHealth(bool force = false)
+    {
+        if (UnityWSBridge.Instance == null || !UnityWSBridge.Instance.IsConnected)
+            return;
+
+        float now = Time.time;
+        if (!force && (now - _lastBroadcastTime < BroadcastMinInterval))
+            return;
+
+        _lastBroadcastTime = now;
+
+        AvatarController ac = GetComponent<AvatarController>();
+        int pid = ac != null ? ac.playerID : -1;
+
+        UnityWSBridge.Instance.SendHealthUpdate(pid, _currentHealth, maxHealth);
+    }
 
     void OnDestroy()
     {
-        if (regenCoroutine != null) StopCoroutine(regenCoroutine);
-        if (stunCoroutine != null) StopCoroutine(stunCoroutine);
+        if (_regenCoroutine != null) StopCoroutine(_regenCoroutine);
+        if (_stunCoroutine != null) StopCoroutine(_stunCoroutine);
     }
 }

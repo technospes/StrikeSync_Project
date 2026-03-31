@@ -1,48 +1,72 @@
-using UnityEngine;
+﻿using UnityEngine;
 
 public class Hitbox : MonoBehaviour
 {
-    private AvatarController myAvatarController;
-    private HealthSystem myHealthSystem;
     public float damageMultiplier = 1.0f;
     public string handType;
-    private Collider hitboxCollider;
 
-    void Start()
+    // ── Lazy-initialized refs (safe even if Start() is skipped when disabled) ──
+    private AvatarController _ctrl;
+    private HealthSystem _myHealth;
+    private Collider _col;
+
+    private AvatarController Ctrl
     {
-        myAvatarController = GetComponentInParent<AvatarController>();
-        myHealthSystem = GetComponentInParent<HealthSystem>();
-        hitboxCollider = GetComponent<Collider>();
+        get
+        {
+            if (_ctrl == null) _ctrl = GetComponentInParent<AvatarController>(true);
+            return _ctrl;
+        }
+    }
+
+    private HealthSystem MyHealth
+    {
+        get
+        {
+            if (_myHealth == null) _myHealth = GetComponentInParent<HealthSystem>(true);
+            return _myHealth;
+        }
+    }
+
+    private Collider Col
+    {
+        get
+        {
+            if (_col == null) _col = GetComponent<Collider>();
+            return _col;
+        }
+    }
+
+    // ── Called by AvatarController coroutine to arm this hitbox ───────────────
+    public void EnableHitbox()
+    {
+        if (Col != null) Col.enabled = true;
     }
 
     void OnTriggerEnter(Collider other)
     {
-        GameObject hitObject = other.gameObject;
-        HealthSystem opponentHealth = hitObject.GetComponentInParent<HealthSystem>();
-        if (opponentHealth == null) opponentHealth = hitObject.GetComponent<HealthSystem>();
+        // Guard: controller must be found
+        if (Ctrl == null) return;
 
-        // Strictly ensure we don't hit ourselves
-        if (opponentHealth != null && opponentHealth != myHealthSystem)
+        // Find opponent health — search upward from the hit collider
+        HealthSystem opponentHealth = other.GetComponentInParent<HealthSystem>(true);
+        if (opponentHealth == null)
+            opponentHealth = other.GetComponent<HealthSystem>();
+
+        // Never damage ourselves
+        if (opponentHealth == null || opponentHealth == MyHealth) return;
+
+        float vel = handType == "Left" ? Ctrl.GetLeftHandVelocity()
+                                       : Ctrl.GetRightHandVelocity();
+
+        // Minimum velocity guard — prevents "walk into fist" false hits
+        if (vel > 1.2f)
         {
-            float punchVelocity = 0f;
-            if (handType == "Left") punchVelocity = myAvatarController.GetLeftHandVelocity();
-            else if (handType == "Right") punchVelocity = myAvatarController.GetRightHandVelocity();
+            Debug.Log($"<color=red>[HIT] {Ctrl.name} {handType} → {other.transform.root.name}  vel={vel:F2}</color>");
+            opponentHealth.TakeDamageFromPunch(vel * damageMultiplier, handType, transform.position);
 
-            // === FIX: ONLY DAMAGE IF VELOCITY IS HIGH ENOUGH ===
-            // This prevents "walking into hands" causing damage.
-            // 1.2 is the same threshold used in AvatarController to trigger a punch animation
-            if (punchVelocity > 1.2f)
-            {
-                Debug.Log($"<color=red>HIT! Vel: {punchVelocity:F2}</color>");
-                opponentHealth.TakeDamageFromPunch(punchVelocity * damageMultiplier, handType, transform.position);
-
-                if (hitboxCollider != null) hitboxCollider.enabled = false;
-            }
+            // Disable self so we only deal one hit per swing
+            if (Col != null) Col.enabled = false;
         }
-    }
-
-    public void EnableHitbox()
-    {
-        if (hitboxCollider != null) hitboxCollider.enabled = true;
     }
 }

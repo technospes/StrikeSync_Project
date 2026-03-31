@@ -1,137 +1,147 @@
-using UnityEngine;
-using System.Diagnostics; // Required for Process
-using System.Collections.Generic; // Required for List
-using System.Collections.Concurrent; // For the queue
+﻿using UnityEngine;
+using System.Diagnostics;
+using System.Collections.Concurrent;
 
+/// <summary>
+/// PoseManager v5.0
+///
+/// CRITICAL FIX (ISSUE-E / ISSUE-F):
+///
+/// v4.0 had a sentinel gate:
+///     bool isV31Packet = (player.lw_vel < -0.5f);
+///     if (isV31Packet) ctrl.ReceiveServerMoveX(player.move_x);
+///
+/// This gate was the direct cause of srvAge reaching 7–8 seconds at idle —
+/// meaning ReceiveServerMoveX was NEVER being called even while the server
+/// was running and sending packets at 37 FPS.
+///
+/// Root cause: Unity's JsonUtility performs silent deserialization.
+/// If the PoseDataPacket struct's field name doesn't exactly match the JSON
+/// key, or if there's any schema mismatch, the field stays at its C# default
+/// value (0f for float). lw_vel defaulting to 0f means (0f < -0.5f) == false,
+/// so ReceiveServerMoveX was never called — every packet was silently dropped
+/// at this gate, and srvAge just kept climbing.
+///
+/// The sentinel was introduced as a v3.1 compatibility shim. pose_server.py
+/// is now always v4.0+ which always sends a valid move_x. The sentinel is no
+/// longer needed and has been REMOVED entirely.
+///
+/// FIX: ReceiveServerMoveX is now called unconditionally on every packet
+/// that has a valid player entry. No gate, no sentinel check.
+/// </summary>
 public class PoseManager : MonoBehaviour
 {
-    [Tooltip("The UDP Receiver component that is listening for data.")]
+    [Tooltip("UDP Receiver component listening for pose data.")]
     public UdpReceiver receiver;
-    [Tooltip("The AvatarController for Player 0 (left).")]
+
+    [Tooltip("AvatarController for Player 0 (left side of camera).")]
     public AvatarController avatarPlayer1;
-    [Tooltip("The AvatarController for Player 1 (right).")]
+
+    [Tooltip("AvatarController for Player 1 (right side of camera).")]
     public AvatarController avatarPlayer2;
 
-    // Reference to the GameManager to show UI
     public GameManager gameManager;
 
-    private float packetTimer = 0f;
-    private int packetCount = 0;
-    private Process poseServerProcess;
+    private float _packetTimer = 0f;
+    private int _packetCount = 0;
+    private Process _poseServerProcess;
 
+    // ─────────────────────────────────────────────────────────────────────────
     void Update()
     {
         string msg;
-        // Process all messages in the queue this frame
         while (receiver.messageQueue.TryDequeue(out msg))
-        {
             ProcessMessage(msg);
-        }
 
-        packetTimer += Time.deltaTime;
-        if (packetTimer > 1.0f) // Log this info once per second
+        _packetTimer += Time.deltaTime;
+        if (_packetTimer > 1f)
         {
-            if (packetCount > 0)
-            {
-                // Use UnityEngine.Debug to be specific
-                UnityEngine.Debug.Log($"<color=green>PoseManager: Received {packetCount} packets in the last second.</color>");
-            }
-            packetCount = 0;
-            packetTimer = 0f;
+            if (_packetCount > 0)
+                UnityEngine.Debug.Log(
+                    $"<color=green>PoseManager: {_packetCount} packets/sec</color>");
+            _packetCount = 0;
+            _packetTimer = 0f;
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
     private void ProcessMessage(string json)
     {
         try
         {
             PoseDataPacket packet = JsonUtility.FromJson<PoseDataPacket>(json);
-            packetCount++;
+            if (packet?.players == null) return;
+            _packetCount++;
 
-            // Inside PoseManager.cs -> ProcessMessage function
-
-            if (packet != null && packet.players != null)
+            foreach (var player in packet.players)
             {
-                foreach (var player in packet.players)
-                {
-                    if (player.id == 0)
-                    {
-                        if (avatarPlayer1 != null && player.landmarks != null)
-                        {
-                            // 1. TELL THE AVATAR IT IS PLAYER 1 (ID 0)
-                            if (avatarPlayer1.playerID != 0) avatarPlayer1.SetPlayerID(0);
+                AvatarController ctrl = GetController(player.id);
+                if (ctrl == null || player.landmarks == null) continue;
 
-                            avatarPlayer1.ReceiveKeypoints(player.landmarks);
-                        }
-                    }
-                    else if (player.id == 1)
-                    {
-                        if (avatarPlayer2 != null && player.landmarks != null)
-                        {
-                            // 2. TELL THE AVATAR IT IS PLAYER 2 (ID 1)
-                            if (avatarPlayer2.playerID != 1) avatarPlayer2.SetPlayerID(1);
+                if (ctrl.playerID != player.id) ctrl.SetPlayerID(player.id);
 
-                            avatarPlayer2.ReceiveKeypoints(player.landmarks);
-                        }
-                    }
-                }
+                // Always forward keypoints — needed for IK and punch detection
+                ctrl.ReceiveKeypoints(player.landmarks);
+
+                // ISSUE-E/F FIX: call unconditionally — no sentinel gate.
+                // pose_server v4.0+ always sends a valid move_x.
+                // The old lw_vel sentinel was causing JsonUtility silent-default
+                // failures that blocked every single packet from reaching
+                // ReceiveServerMoveX, causing srvAge to climb to 7–8 seconds.
+                ctrl.ReceiveServerMoveX(player.move_x);
+
+                if (player.jumped)
+                    ctrl.ReceiveJump();
             }
         }
         catch (System.Exception e)
         {
-            // Use UnityEngine.Debug to be specific
-            UnityEngine.Debug.LogError($"<color=red>Error parsing JSON:</color> {e.Message}\nJSON: {json}");
+            UnityEngine.Debug.LogError(
+                $"<color=red>JSON parse error:</color> {e.Message}\nJSON: {json}");
         }
     }
 
-    // --- These are the functions GameManager calls ---
+    // ─────────────────────────────────────────────────────────────────────────
+    private AvatarController GetController(int id)
+    {
+        if (id == 0) return avatarPlayer1;
+        if (id == 1) return avatarPlayer2;
+        return null;
+    }
 
+    // ─────────────────────────────────────────────────────────────────────────
     public void StartPoseDetection()
     {
-        // Start the UDP listener
-        if (receiver != null)
-            receiver.StartListening(); // This is the new function
-
-        // Start the Python script
+        if (receiver != null) receiver.StartListening();
         try
         {
             string scriptPath = @"E:\StrikeSync_Project\Python_Server\pose_server.py";
             string pythonPath = @"E:\StrikeSync_Project\Python_Server\venv\Scripts\python.exe";
-
-            poseServerProcess = new Process();
-            poseServerProcess.StartInfo.FileName = pythonPath;
-            poseServerProcess.StartInfo.Arguments = scriptPath;
-            poseServerProcess.StartInfo.UseShellExecute = false;
-            poseServerProcess.StartInfo.CreateNoWindow = true;
-            poseServerProcess.Start();
-            // Use UnityEngine.Debug to be specific
-            UnityEngine.Debug.Log("Python Pose Server started!");
+            _poseServerProcess = new Process();
+            _poseServerProcess.StartInfo.FileName = pythonPath;
+            _poseServerProcess.StartInfo.Arguments = scriptPath;
+            _poseServerProcess.StartInfo.UseShellExecute = false;
+            _poseServerProcess.StartInfo.CreateNoWindow = true;
+            _poseServerProcess.Start();
+            UnityEngine.Debug.Log("Python Pose Server v5.0 started.");
         }
         catch (System.Exception e)
         {
-            // Use UnityEngine.Debug to be specific
             UnityEngine.Debug.LogError("FAILED to start pose_server.py: " + e.Message);
         }
     }
 
     public void StopPoseDetection()
     {
-        // Stop the UDP listener
-        if (receiver != null)
-            receiver.StopListening(); // This is the new function
-
-        // Kill the Python script
-        if (poseServerProcess != null && !poseServerProcess.HasExited)
+        if (receiver != null) receiver.StopListening();
+        if (_poseServerProcess != null && !_poseServerProcess.HasExited)
         {
-            poseServerProcess.Kill();
-            poseServerProcess.Dispose();
-            poseServerProcess = null;
-            // Use UnityEngine.Debug to be specific
+            _poseServerProcess.Kill();
+            _poseServerProcess.Dispose();
+            _poseServerProcess = null;
             UnityEngine.Debug.Log("Python Pose Server stopped.");
         }
     }
-    void OnDestroy()
-    {
-        StopPoseDetection();
-    }
+
+    void OnDestroy() => StopPoseDetection();
 }
