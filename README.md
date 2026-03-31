@@ -1,8 +1,11 @@
-# StrikeSync: AI-Powered Motion Combat Interface
+```
+# StrikeSync: AI-Powered Motion Combat Interface 🥊
 
 Turn your webcam into a real-time motion capture controller for fighting games.
 
-StrikeSync is a low-latency, markerless human–computer interface (HCI) that bridges computer vision and game development. By leveraging the YOLO11 pose estimation model to track full-body movement in real time and streaming data to Unity via UDP, it enables a “play-as-you-fight” experience without the need for VR headsets or mocap suits.
+StrikeSync is a low-latency, markerless human–computer interface (HCI) that bridges computer vision and game development. By leveraging the YOLO11 pose estimation model to track full-body movement in real time and streaming data to Unity via UDP, it enables a “play-as-you-fight” experience without the need for VR headsets or mocap suits. 
+
+**🔥 What's NEW :** StrikeSync now features a fully integrated Web UI and WebSocket Bridge for seamless character and map selection, alongside a rebuilt zero-drift motion tracking engine!
 
 ---
 
@@ -13,284 +16,213 @@ StrikeSync is a low-latency, markerless human–computer interface (HCI) that br
 - [Tech Stack](#tech-stack)
 - [System Architecture](#system-architecture)
 - [Installation & Setup](#installation--setup)
-  - [Python Server](#python-server-setup)
-  - [Unity Client](#unity-client-setup)
 - [How to Run](#how-to-run)
 - [Usage Guide](#usage-guide)
-  - [Controls (Body Gestures)](#controls-body-gestures)
-  - [Calibration](#calibration)
 - [Project Structure](#project-structure)
-- [Configuration Details](#configuration-details)
 - [Performance & Optimization](#performance--optimization)
-- [Known Limitations](#known-limitations)
 - [Roadmap](#roadmap)
-- [Contribution Guidelines](#contribution-guidelines)
-- [License](#license)
-- [Author](#author)
+- [License & Author](#license--author)
 
 ---
 
 ## Demo
 
-> ....In_Progress
+> 🚀 **v5.0 is LIVE!** Watch the gameplay demo on YouTube [Link coming soon...]
 
 Examples:
 - Real-time combat where physical punches and dodges translate directly into in‑game actions.
+- Seamless Web UI for on-the-fly character and arena swapping.
 - Two-player local battles driven entirely by body movement.
 
 ---
 
 ## Key Features
 
-- **Ultra-Low Latency Architecture**  
-  Optimized Python server using `orjson` serialization and UDP broadcasting to keep pose packets lightweight and highly responsive.
-
-- **Advanced Pose Estimation**  
-  Powered by YOLO11 pose models, providing high-accuracy skeletal tracking even during rapid, high-intensity combat motions.
-
-- **Physics-Based Combat**  
-  - **Velocity Detection**: Punches are triggered by real hand velocity, not just static keyframes.  
-  - **Lean-to-Move**: Move your character laterally by physically leaning left or right.  
-  - **Depth Navigation**: Step forward/backward in the arena by adjusting stance width.
-
-- **Real-Time Inverse Kinematics**  
-  IK retargeting for head, hands, and elbows so the 3D avatar mirrors your stance and strikes.
-
-- **Multiplayer Ready**  
-  Native support for up to two players for local 1v1 gameplay on the same machine.
-
-- **Performance Optimized**  
-  CUDA acceleration, configurable frame skipping, and float32 precision tuning to maintain 30+ FPS on consumer GPUs.
+- **Ultra-Low Latency Architecture:** Optimized Python server using `orjson` serialization and UDP broadcasting to keep pose packets lightweight and highly responsive.
+- **Advanced Pose Estimation (v5.0):** Powered by YOLO11, featuring a new "Zero-Drift" locked calibration system and "Lean-Guard" filtering to perfectly isolate body dodges from rapid punches.
+- **Physics-Based Combat:** - **Velocity Detection:** Punches are triggered by true physical hand velocity, mapped accurately regardless of screen mirroring.
+  - **Lean-to-Move:** Move laterally by physically leaning left or right, with sub-threshold noise clamping for rock-solid idle states.
+- **Web-Driven UI & Bridge:** A dedicated local web dashboard connected via WebSockets allows players to select fighters (Art Clown, LadyHawk, Mutants, etc.) and maps dynamically without touching the Unity editor.
+- **Real-Time Inverse Kinematics:** IK retargeting for head, hands, and elbows so the 3D avatar perfectly mirrors your real-world stance.
 
 ---
 
 ## Tech Stack
 
 **Core AI & Backend**
+- Model: YOLO11 (Ultralytics)
+- Framework: PyTorch (CUDA-optimized)
+- Vision: OpenCV
+- Networking: Python sockets (UDP), `orjson`
 
-- Model: YOLO11 (Ultralytics)  
-- Framework: PyTorch (CUDA-optimized)  
-- Vision: OpenCV  
-- Networking: Python sockets (UDP), `orjson`  
-
-**Game Client**
-
-- Engine: Unity 2022.3 LTS or newer  
-- Language: C#  
-- Systems: Animator IK, Coroutines, custom UDP listener
+**Game Client & Bridge**
+- Engine: Unity 2022.3 LTS (C#, Animator IK, Coroutines)
+- Bridge: Node.js, WebSockets (`ws`)
+- UI: HTML5, CSS, Vanilla JS
 
 ---
 
 ## System Architecture
 
-StrikeSync follows a decoupled server–client architecture to maximize performance and maintainability.
+StrikeSync utilizes a decoupled, three-tier architecture to maximize performance:
 
-### Pose Server (Python)
-
-- Captures raw video from the webcam (default 640×360 @ 30 FPS).  
-- Runs inference using `yolo11n-pose.pt` (or `yolo11s-pose.pt` for higher accuracy).  
-- Extracts 17 keypoints (nose, shoulders, elbows, wrists, hips, etc.).  
-- Normalizes coordinates and confidence scores, then serializes them with `orjson`.  
-- Broadcasts pose packets via UDP to `localhost:9001`.
-
-### Game Client (Unity)
-
-- **UDP Receiver**: Listens on port `9001` on a background thread to avoid blocking the main game loop.  
-- **Pose Manager**: Deserializes incoming data and applies interpolation/smoothing.  
-- **Avatar Controller**:  
-  - Maps 2D landmarks to 3D world space.  
-  - Computes velocity for hit detection and movement.  
-  - Drives Animator and IK rigs for responsive combat animations.
+1. **Pose Server (Python):** Captures 30+ FPS webcam video, runs YOLO11 inference, applies EMA smoothing, calculates physical displacement/velocity, and broadcasts lightweight JSON packets via UDP to port `9001`.
+2. **WebSocket Bridge (Node.js):** Acts as the middleman for the frontend UI, listening for player/map selections and forwarding them to Unity via WebSockets.
+3. **Game Client (Unity):** Listens to the UDP stream for movement/combat data and the WS stream for game-state changes. Applies root-motion animations and IK to drive the characters in real-time.
 
 ---
 
 ## Installation & Setup
 
 ### Prerequisites
+- Python 3.8+
+- Node.js (v16+)
+- Unity 2022.3 LTS or newer
+- Webcam
+- NVIDIA GPU (Highly recommended for CUDA acceleration)
 
-- Python 3.8+  
-- Unity 2022.3 LTS or newer  
-- Webcam  
-- NVIDIA GPU (recommended for CUDA acceleration)
-
-### Python Server Setup
-
-#### Clone the repository
-```
-git clone https://github.com/technospes/strikesync-project.git
+### 1. Python Server Setup
+```bash
+git clone [https://github.com/technospes/strikesync-project.git](https://github.com/technospes/strikesync-project.git)
 cd strikesync-project/Python_Server
+pip install torch ultralytics opencv-python orjson numpy
+```
+> *For GPU acceleration, ensure you install a PyTorch build with CUDA support matching your driver.*
+
+### 2. WebSocket Bridge Setup
+```bash
+cd ../strikesync-bridge
+npm install
 ```
 
-#### Install dependencies
-
-pip install torch ultralytics opencv-python orjson numpy
-
-> For GPU acceleration, ensure you install a PyTorch build with CUDA support matching your driver and CUDA toolkit version.
-
-### Unity Client Setup
-
-1. Open Unity Hub.  
-2. Add the project from the `Unity_Client/` directory.  
-3. Let Unity import required packages (URP, TextMeshPro, etc.).  
-4. Open `Scenes/Game_Scene.unity`.
+### 3. Unity Client Setup
+1. Open Unity Hub and add the `Unity_Client/` directory.
+2. Allow Unity to import required packages.
+3. Open `Scenes/Game_Scene.unity`.
 
 ---
 
 ## How to Run
 
-1. **Start the AI Server**
+You need to run the system in three parts for the full experience:
 
-   From the `Python_Server` directory:
-
-python pose_server.py
-
-The console should display a banner such as `YOLO11 Optimized Pose Server` and confirm that the camera stream is active.
-
-2. **Start the Game**
-
-- In the Unity Editor, open `Game_Scene.unity`.  
-- Press the Play (▶) button.  
-- Stand 2–3 meters from the camera so your full upper body is visible.  
-- The avatar should align with your pose and respond to movement.
+1. **Start the AI Server:**
+   ```bash
+   cd Python_Server
+   python pose_server.py
+   ```
+2. **Start the WebSocket Bridge & UI:**
+   ```bash
+   cd strikesync-bridge
+   node server.js
+   ```
+   *(Then open the `strikesync-ui/index.html` file in your browser).*
+3. **Start the Game:**
+   Hit Play (▶) in the Unity Editor. Use the Web UI to select your character, stand 2–3 meters from the camera, and start fighting!
 
 ---
 
-## Usage Guide
+## Usage Guide & Calibration
 
-### Controls (Body Gestures)
-
-| Action              | Gesture / Movement                                                |
+| Action              | Physical Gesture                                                  |
 |---------------------|-------------------------------------------------------------------|
-| Punch (Left/Right)  | Throw a fast punch; exceeding a velocity threshold triggers hits |
-| Move Left / Right   | Lean your upper body left or right                               |
-| Move Forward / Back | Widen stance (forward) or narrow stance (backward)               |
-| Guard               | Raise both fists above hip level                                 |
+| Punch (Left/Right)  | Throw a fast punch (must exceed the dynamic velocity threshold). |
+| Move Left / Right   | Lean your upper body left or right.                               |
+| Guard               | Raise both fists above hip level.                                 |
 
-### Calibration
-
-- **Lighting**: Use even front lighting; avoid strong backlighting which can reduce detection quality.  
-- **Background & Clothing**: Wear clothing that contrasts with the background to improve YOLO keypoint stability.
+**Calibration Tips:** - The system uses a **Locked Neutral Calibration**. It requires 8 frames of stable warmup when you first start. Stand naturally in the center of your frame when booting the server.
+- Ensure your room is well-lit from the front to avoid harsh shadows on your hips/shoulders.
 
 ---
-```
+
 ## Project Structure
 
+```text
 StrikeSync_Project/
 ├── Python_Server/
-│ ├── pose_server.py # Main entry point for AI tracking
-│ ├── yolo11n-pose.pt # Pre-trained YOLO model (Nano)
-│ ├── yolo11s-pose.pt # Pre-trained YOLO model (Small)
-│ └── script.cpp # (Optional) C++ optimizations
-├── Unity_Client/
-│ ├── Assets/
-│ │ ├── Scenes/ # MainMenu and Game_Scene
-│ │ ├── Scripts/
-│ │ │ ├── AvatarController.cs # IK and movement logic
-│ │ │ ├── UdpReceiver.cs # Networking layer
-│ │ │ ├── GameManager.cs # Match state management
-│ │ │ └── HealthSystem.cs # Combat and health handling
-│ │ ├── Prefabs/ # Character models and UI
-│ │ └── Settings/ # Render pipeline and graphics settings
-│ └── Packages/ # Unity package dependencies
-└── README.md
-
+│   ├── pose_server.py       # YOLO AI tracking and UDP broadcast
+│   └── yolo11*-pose.pt      # Pre-trained models (ignored in git, handled via LFS)
+├── strikesync-bridge/
+│   ├── server.js            # Node.js WebSocket router
+│   └── package.json
+├── strikesync-ui/
+│   ├── index.html           # Web dashboard for Character/Map selection
+│   └── styles.css
+└── Unity_Client/
+    ├── Assets/
+    │   ├── Scenes/          # MainMenu, Fight Arenas
+    │   ├── Scripts/         # AvatarController (v5.0), PoseManager, UnityWSBridge
+    │   └── Prefabs/         # Character Models & Animations
+    └── Packages/
 ```
-
----
-
-## Configuration Details
-
-### Server Configuration (`pose_server.py`)
-
-Tune these variables at the top of the script to match your hardware and performance targets:
-
-- `CAM_INDEX` – Camera device index (default `0`).  
-- `INFERENCE_SIZE` – Input resolution for the model (default `256` for speed).  
-- `MODEL_CONF` – Confidence threshold (default `0.4`).  
-- `MAX_PLAYERS` – Maximum number of tracked players (default `2`).  
-
-### Client Configuration (Unity Inspector)
-
-Select the player avatar in the scene to adjust the `AvatarController` parameters:
-
-- **Sensitivity**  
-  - Punch Velocity Threshold – Minimum hand speed required to trigger a hit (default `1.2`).  
-  - Lean Threshold – Sensitivity for lateral movement (default `0.08`).  
-
-- **Smoothing**  
-  - Pose Smoothing Factor – Higher values yield smoother motion with slightly more latency (default `0.6`).  
-
-- **Networking**  
-  - Listen Port – Must match the Python server UDP port (default `9001`).
 
 ---
 
 ## Performance & Optimization
 
-- **CUDA Acceleration**  
-  Automatically enables `torch.backends.cudnn.benchmark` on NVIDIA GPUs to maximize throughput for stable input sizes.
-
-- **Frame Skipping**  
-  Configurable `FRAME_SKIP` value decouples camera frame rate from inference, allowing you to trade accuracy granularity for FPS.
-
-- **Memory Management**  
-  Strategic `torch.cuda.empty_cache()` calls during warmup reduce the chance of VRAM fragmentation in long sessions.
-
-- **Fast Serialization**  
-  Uses `orjson` instead of the standard `json` module to significantly reduce serialization overhead for UDP packets.
+- **CUDA Acceleration:** Automatically enables `torch.backends.cudnn.benchmark` to maximize throughput.
+- **Adaptive Frame Skipping:** The Python server monitors its own FPS and dynamically adjusts `FRAME_SKIP` and inference size to maintain a smooth 30+ FPS.
+- **Sub-Threshold Clamping:** Reduces UDP noise by dropping micro-movements before they ever hit the network layer.
 
 ---
 
-## Known Limitations
-
-- **Single-Camera Depth Approximation**  
-  Z-axis movement is inferred from shoulder width and stance changes, not true 3D depth sensing.  
-
-- **Occlusion Sensitivity**  
-  Crossing arms or blocking limbs may momentarily degrade IK quality or hit detection.  
-
-- **Local Networking Only (Current)**  
-  UDP communication is configured for localhost. Online play requires additional networking work (port forwarding, relay server, or VPN).
-
----
-
-## Roadmap
-
-- [ ] Online multiplayer using WebRTC or a relay server for remote 1v1 matches.  
-- [ ] Gesture macros for advanced moves (for example, “Hadouken” or combo chains).  
-- [ ] Dynamic 3D arenas with background segmentation and virtual staging.  
-- [ ] High-performance C++/TensorRT server variant for ultra-low latency.
-
----
-
-## Contribution Guidelines
-
-Contributions are welcome.
-
-1. Fork the repository.  
-2. Create a feature branch:  
-```
-git checkout -b feature/NewMove
-```
-3. Commit your changes.  
-4. Push the branch:  
-```
-git push origin feature/NewMove
-```
-
-5. Open a Pull Request describing your change and test coverage.
-
----
-
-## License
+## License & Author
 
 Distributed under the MIT License. See `LICENSE` for details.
 
+**Technospes (Ayush Shukla)**
+- GitHub: [technospes](https://github.com/technospes)
+- LinkedIn: [Ayush Shukla](https://www.linkedin.com/in/ayushshukla-ar/)
+```
+
+***
+
+### 2. The New `V5_ARCHITECTURE_AND_UPDATES.md`
+*(Create this as a new file in your root directory. This acts as a deep-dive dev log to show off the complex problem-solving you just completed).*
+
+```markdown
+# StrikeSync v5.0: Architecture & Engine Updates
+
+Version 5.0 represents a massive paradigm shift in how StrikeSync handles human-computer interaction, networking, and animation logic. This document outlines the core engineering challenges faced in earlier versions and the specific architectural solutions implemented in the v5.0 stack.
+
+## 1. The Motion Tracking Engine (Python Server)
+
+### The "Zero-Drift" Calibration Model
+**The Problem:** Previous versions relied on an Exponential Moving Average (EMA) to determine the player's "center" (neutral hip position). This caused the neutral reference to slowly "chase" the player when they leaned. Returning to a true physical center resulted in the system registering an opposite-direction lean, causing perpetual walking bugs.
+**The Solution:** Implemented a **Locked Calibration** strategy. The server now waits for a configurable `NEUTRAL_WARMUP_FRAMES` (default: 8) to gather a stable initial read, locks that position in memory, and never updates it unless a manual recalibration is triggered. Displacement is now absolute, completely eliminating baseline drift.
+
+### Sub-Threshold Output Clamping
+To prevent microscopic seating adjustments from triggering the Unity walking state, v5.0 introduces an aggressive deadzone (`WALK_ZONE = 0.012`) combined with a hard output clamp (`MOVE_OUTPUT_MIN = 0.05`). If the EMA output falls below 5%, it instantly snaps to `0.0`, ensuring a crisp, immediate halt in the game client.
+
 ---
 
-## Author
+## 2. The Game Client Logic (Unity C#)
 
-**Technospes**
+### "Lean-Guard" Punch Isolation
+**The Problem:** In a markerless 2D camera setup, physically leaning your body to the side naturally translates the 2D coordinates of your wrists. This coordinate shift caused false-positive, high-velocity spikes, triggering accidental punches simply by walking.
+**The Solution:** The `AvatarController.cs` now measures true hip-center translation (`hipDelta`) per frame. If the body's core translates beyond the `leanGuardThreshold`, the system classifies the gesture as a structural lean and temporarily suppresses the punch detection module. Punches now only fire when the arms move *independently* of the torso.
 
-- GitHub (Technospes): https://github.com/technospes
-- LinkedIn (Ayush Shukla): https://www.linkedin.com/in/ayushshukla-ar/
+### Physical Hand Mapping (Pre-Mirror)
+**The Problem:** Because the player needs to see themselves mirrored on screen, the keypoint array is flipped. However, calculating punch velocity using mirrored targets resulted in physical right hooks triggering in-game left punches.
+**The Solution:** Punch detection was decoupled from the IK target array. The system now parses the raw, pre-mirrored `LandmarkData` directly from the UDP packet (`PhysPos`), ensuring that a physical right arm swing accurately triggers the `PunchRight` Animator trigger, regardless of screen orientation.
+
+---
+
+## 3. Networking & Pipeline Overhaul
+
+### The Silent JSON Deserialization Fix
+**The Problem:** The Unity client was experiencing severe input lag (with `srvAge` climbing to 8+ seconds), causing a "rubber-banding" effect. The root cause was Unity's `JsonUtility` silently failing to deserialize a sentinel variable (`lw_vel`) due to strict type/schema mapping, causing the `PoseManager` to silently drop 100% of incoming movement packets.
+**The Solution:** The networking logic was heavily refactored to remove outdated protocol sentinels. `PoseManager.cs` now parses and forwards `move_x` data unconditionally, restoring 1-to-1 frame sync with the Python server.
+
+### The Web UI & WebSocket Bridge
+v5.0 introduces a dedicated local Web Dashboard to control the game state:
+- **Node.js Bridge:** A lightweight WebSocket server (`strikesync-bridge`) handles asynchronous, bi-directional communication between the browser and Unity.
+- **Dynamic Swapping:** Character models and combat arenas can now be hot-swapped mid-game via the web interface, bypassing the Unity Editor entirely.
+
+---
+
+## 4. Animation Stabilization
+
+### Root Motion "Boomerang" Fix
+To support the new `t.x += worldDir * moveSpeed * Time.deltaTime;` physics-driven movement system, all combat and locomotion animations (e.g., Art Clown, LadyHawk) were updated to use **Bake Into Pose** for Root Transform Position (XZ). This prevents the animation clips from physically hijacking the GameObject's transform, eliminating the "PUBG-style lag loop" and keeping locomotion strictly under script control.
+```
