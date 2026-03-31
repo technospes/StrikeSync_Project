@@ -1,42 +1,3 @@
-"""
-pose_server.py — StrikeSync Pose Server v8.0
-=============================================
-
-CHANGE FROM v6/v7:
-
-FIX-A1  STOP_ZONE hysteresis — eliminates the 2–3 cycle glitch walk loop.
-
-Root cause (log evidence):
-  Python PERF showed: move_x=+0.971 → +1.000 → +1.000 → +0.000  (clean stop)
-  Unity showed: character kept walking for 2–3 cycles after user stopped leaning.
-
-The Python EMA with MOVE_EMA_ALPHA=0.35 decays across ~9 frames (~270ms at
-33fps) as the user's hip returns toward neutral.  During that decay window,
-values like 0.27, 0.18, 0.12 are sent to Unity.  These are above Unity's
-walkDeadZone=0.08, so Unity treats them as valid walk input and resets its
-idle timer each packet.  The idle timer never completes, _lockedDir stays
-locked, and the character keeps walking.
-
-FIX: Two separate zones instead of one.
-
-  WALK_ZONE  = 0.012   (unchanged) — displacement must exceed this to START walking
-  STOP_ZONE  = 0.022               — displacement must fall BELOW this to STOP
-
-  STOP_ZONE > WALK_ZONE creates hysteresis:
-  - Walking starts: |displacement| crosses WALK_ZONE going outward
-  - Walking stops:  |displacement| falls below STOP_ZONE on the return stroke
-  - Since STOP_ZONE > WALK_ZONE, the return stroke snaps smoothed_move_x=0
-    the moment displacement enters the stop zone, well before the EMA has
-    time to decay gradually.
-  - No sub-threshold non-zero values reach Unity during the return stroke.
-  - Character stops immediately, no loop cycles.
-
-This is the standard joystick hysteresis pattern used in all fighting game
-controllers — start threshold < stop threshold ensures decisive stop response.
-
-NO OTHER LOGIC CHANGED.  Python is otherwise working correctly.
-"""
-
 import torch
 import time
 import warnings
@@ -132,6 +93,13 @@ class PlayerState:
         self.smoothed_move_x  = 0.0
         self._warmup_frames   = 0
         self._warmup_sum      = 0.0
+        # FIX-FLIP: direction-flip debounce — require a sign change to hold for
+        # FLIP_CONFIRM_FRAMES consecutive frames before emitting the new direction.
+        # Single-frame bounces (e.g. -1.0 → +0.95 → -1.0) are suppressed.
+        self._last_emitted_sign = 0   # sign of last output sent to Unity
+        self._flip_candidate_sign = 0
+        self._flip_candidate_frames = 0
+        self.FLIP_CONFIRM_FRAMES = 3  # must hold new direction this many frames
 
     def update_ema(self, kpts_xy: np.ndarray) -> np.ndarray:
         if self.ema is None or self.ema.shape != kpts_xy.shape:
@@ -181,9 +149,41 @@ class PlayerState:
 
         if abs(self.smoothed_move_x) < MOVE_OUTPUT_MIN:
             self.smoothed_move_x = 0.0
+            # Going to zero is always immediate — no debounce needed for stop
+            self._last_emitted_sign = 0
+            self._flip_candidate_sign = 0
+            self._flip_candidate_frames = 0
             return 0.0
 
-        return float(np.clip(self.smoothed_move_x, -1.0, 1.0))
+        output = float(np.clip(self.smoothed_move_x, -1.0, 1.0))
+        new_sign = 1 if output > 0 else -1
+
+        # FIX-FLIP: debounce direction changes
+        # If direction matches what we last emitted, pass through immediately.
+        # If it's a new direction, require FLIP_CONFIRM_FRAMES consecutive frames.
+        if new_sign == self._last_emitted_sign or self._last_emitted_sign == 0:
+            # Continuing same direction or starting fresh — emit directly
+            self._last_emitted_sign = new_sign
+            self._flip_candidate_sign = 0
+            self._flip_candidate_frames = 0
+            return output
+        else:
+            # Direction flip detected — start or continue confirmation window
+            if new_sign == self._flip_candidate_sign:
+                self._flip_candidate_frames += 1
+            else:
+                self._flip_candidate_sign = new_sign
+                self._flip_candidate_frames = 1
+
+            if self._flip_candidate_frames >= self.FLIP_CONFIRM_FRAMES:
+                # Confirmed flip — emit new direction
+                self._last_emitted_sign = new_sign
+                self._flip_candidate_sign = 0
+                self._flip_candidate_frames = 0
+                return output
+            else:
+                # Not yet confirmed — suppress the flip, emit zero this frame
+                return 0.0
 
     def recalibrate(self, raw_kpts: np.ndarray, frame_w: int):
         """Force reset of neutral to current hip position."""
