@@ -1,4 +1,3 @@
-```makrdown
 # StrikeSync: AI-Powered Motion Combat Interface 🥊
 
 Turn your webcam into a real-time motion capture controller for fighting games.
