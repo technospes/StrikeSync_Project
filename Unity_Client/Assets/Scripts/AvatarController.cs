@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using UnityEngine;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  AvatarController — v8.0
-//  Final production version — every known issue addressed.
+//  AvatarController — v8.2
+//  v8.1: gap/Sad_idle fallback, lean guard using smoothed landmarks + sustained velocity.
+//  v8.2: UpdateWalk rewrite — lerp can no longer un-zero a committed stop.
+//        Stop path now returns before the lerp executes (see UpdateWalk comments).
 //
 // ─────────────────────────────────────────────────────────────────────────────
 //  FIX-A  Glitchy walk loop (2–3 cycles before stopping)
@@ -144,6 +146,10 @@ public class AvatarController : MonoBehaviour
 
     // ── Private — server ─────────────────────────────────────────────────────
     private const float SERVER_EXPIRE_S = 2.5f;
+    // FIX-GAP: if no packet for this long, treat as zero input (→ Sad_idle)
+    // This is shorter than SERVER_EXPIRE_S so the character snaps to idle quickly
+    // instead of staying in the last animated state for up to 2.5s.
+    private const float SERVER_IDLE_AFTER_S = 0.5f;
     private const float SERVER_WARN_S = 5f;
 
     private float _srvMoveX;
@@ -184,6 +190,11 @@ public class AvatarController : MonoBehaviour
     private bool _hipInitialized = false;
     // FIX-B1: rolling lean frame counter
     private int _leanFramesRemaining = 0;
+    // FIX-LEAN: sustained lean velocity accumulator — catches slow leans that
+    // never produce a single large delta but steadily shift the hip position
+    private float _hipVelocityEMA = 0f;
+    private const float HIP_VEL_ALPHA = 0.4f;
+    private const float HIP_VEL_SUSTAINED_THRESH = 0.012f; // EMA velocity triggering guard
 
     // keypoint indices — YOLO 17-point
     const int Nose = 0, LShoulder = 5, RShoulder = 6,
@@ -331,17 +342,39 @@ public class AvatarController : MonoBehaviour
     }
 
     // ── Walk ──────────────────────────────────────────────────────────────────
+    //
+    //  v8.2 STOP LOGIC REWRITE
+    //  ────────────────────────
+    //  Previous bug: the lerp  _animMoveX = Lerp(_animMoveX, _targetMoveX, s)
+    //  ran unconditionally AFTER the instant-stop block.  Even when the idle
+    //  timeout fired and set _animMoveX=0, the lerp immediately re-blended it
+    //  toward the (still non-zero) _targetMoveX for that one extra frame,
+    //  producing a tiny non-zero MoveX → Animator re-entered walk for 1–2 frames.
+    //
+    //  New design — two separate concerns:
+    //
+    //  1. STOP CONFIRM DEBOUNCE (_stopDebounceTimer, replaces _idleTimer)
+    //     Purpose: tolerate brief 1-frame zero packets mid-walk (network noise).
+    //     Duration: moveIdleTimeout (default 0.10s).
+    //     Behaviour: while debouncing, hold _lockedDir and _targetMoveX unchanged.
+    //     When debounce expires: commit the stop — zero EVERYTHING including
+    //     _animMoveX — then RETURN immediately before the lerp can run.
+    //
+    //  2. LERP (walk acceleration only)
+    //     Only runs when there IS active input (_targetMoveX != 0).
+    //     Never runs in the same frame as a committed stop.
+    //     This means the lerp can never un-zero a stop decision.
+    //
     void UpdateWalk()
     {
-        float raw = _srvEverReceived ? _srvMoveX : 0f;
+        // ── 1. Read raw server value ──────────────────────────────────────────
+        float raw = (_srvEverReceived && _srvAge < SERVER_IDLE_AFTER_S) ? _srvMoveX : 0f;
         if (invertMoveX) raw = -raw;
-
-        // Punch lock suppresses walk input (lean-triggered punch ≠ walk start)
         if (_punchLockTimer > 0f) raw = 0f;
 
         float inputMoveX = IsPlayer1 ? raw : -raw;
-
         inputMoveX = Mathf.Clamp(inputMoveX, -1f, 1f);
+
         if (Mathf.Abs(inputMoveX) < walkDeadZone)
             inputMoveX = 0f;
         else
@@ -357,8 +390,10 @@ public class AvatarController : MonoBehaviour
 
         bool hasInput = (inputMoveX != 0f);
 
+        // ── 2. State machine ──────────────────────────────────────────────────
         if (hasInput)
         {
+            // Active input — reset debounce, update direction lock & target
             _idleTimer = 0f;
             float dir = Mathf.Sign(inputMoveX);
 
@@ -366,41 +401,46 @@ public class AvatarController : MonoBehaviour
             { _lockedDir = dir; _targetMoveX = dir; }
             else if (Mathf.Abs(raw) > reverseDirectionThreshold)
             { _lockedDir = dir; _targetMoveX = dir; }
+
+            // ── 3a. ACCELERATION lerp (only when actively walking) ───────────
+            float s = 1f - Mathf.Exp(-walkAccelDamping * Time.deltaTime);
+            _animMoveX = Mathf.Lerp(_animMoveX, _targetMoveX, s);
+            if (Mathf.Abs(_animMoveX) < 0.05f) _animMoveX = 0f;
+            _anim?.SetFloat("MoveX", _animMoveX);
         }
         else
         {
+            // No input — run stop-confirm debounce
             _idleTimer += Time.deltaTime;
-            // FIX-A2: 100ms timeout — snappier stop
+
             if (_idleTimer >= moveIdleTimeout)
             {
+                // ── 3b. COMMITTED STOP — zero everything, skip lerp entirely ──
                 _targetMoveX = 0f;
                 _lockedDir = 0f;
-
-                // INSTANT STOP (no smoothing)
                 _animMoveX = 0f;
                 _anim?.SetFloat("MoveX", 0f);
+
+                if (debugMode && _srvEverReceived)
+                    Debug.Log($"<color=lime>[{name}] MoveX=0.00 raw={raw:F2} " +
+                              $"srvAge={_srvAge:F2} locked=0 [STOP]</color>");
+                return;
+            }
+            else
+            {
+                // ── 3c. DEBOUNCE WINDOW — drain toward zero smoothly ──────────
+                // 🔥 FIXED: drain to 0, not to _targetMoveX
+                float s = 1f - Mathf.Exp(-walkAccelDamping * Time.deltaTime);
+                _animMoveX = Mathf.Lerp(_animMoveX, 0f, s);  // ← THIS IS THE FIX
+                if (Mathf.Abs(_animMoveX) < 0.05f) _animMoveX = 0f;
+                _anim?.SetFloat("MoveX", _animMoveX);
             }
         }
 
-        float s = 1f - Mathf.Exp(-walkAccelDamping * Time.deltaTime);
-        _animMoveX = Mathf.Lerp(_animMoveX, _targetMoveX, s);
-        if (Mathf.Abs(_animMoveX) < 0.05f) _animMoveX = 0f;
-
-        _anim?.SetFloat("MoveX", _animMoveX);
-
-        // FIX-D: skip debug log for players that have never connected
         if (debugMode && _srvEverReceived)
             Debug.Log($"<color=lime>[{name}] MoveX={_animMoveX:F2} raw={raw:F2} " +
                       $"srvAge={_srvAge:F2} locked={_lockedDir} " +
                       $"punchLock={_punchLockTimer:F2} leanFr={_leanFramesRemaining}</color>");
-    }
-
-    void DrainToIdle(float damping)
-    {
-        float s = 1f - Mathf.Exp(-damping * Time.deltaTime);
-        _animMoveX = Mathf.Lerp(_animMoveX, 0f, s);
-        if (Mathf.Abs(_animMoveX) < 0.05f) _animMoveX = 0f;
-        _anim?.SetFloat("MoveX", _animMoveX);
     }
 
     void ApplyMovementAndClamp()
@@ -446,16 +486,29 @@ public class AvatarController : MonoBehaviour
         Vector3 curPhysR = PhysPos(_kp, 10) - PhysPos(_kp, 6);
 
         // ── Lean guard ────────────────────────────────────────────────────────
-        Vector3 hipNow = (PhysPos(_kp, 11) + PhysPos(_kp, 12)) * 0.5f;
+        // FIX-LEAN: Use SMOOTHED hip position (_smoothed array) instead of raw
+        // keypoints. Raw kp jitter was causing false guard triggers during normal
+        // arm movement, AND failing to catch slow leans because per-frame raw
+        // deltas are too small. Smoothed landmarks are stable enough that even
+        // a slow lean produces a consistent non-zero per-frame delta.
+        Vector3 hipNow = (_smoothed[LHip] + _smoothed[RHip]) * 0.5f;
 
         if (_hipInitialized)
         {
             float hipDelta = Vector3.Distance(hipNow, _lastHipWorld);
+
+            // EMA of per-frame hip velocity (sustained lean detection)
+            _hipVelocityEMA = HIP_VEL_ALPHA * hipDelta + (1f - HIP_VEL_ALPHA) * _hipVelocityEMA;
+
+            bool instantLean = hipDelta > leanGuardThreshold;
+            bool sustainedLean = _hipVelocityEMA > HIP_VEL_SUSTAINED_THRESH;
+
             // FIX-B1: lower threshold catches slow leans
-            if (hipDelta > leanGuardThreshold)
+            if (instantLean || sustainedLean)
             {
                 if (debugMode)
                     Debug.Log($"<color=yellow>[{name}] Lean hipDelta={hipDelta:F4} " +
+                              $"velEMA={_hipVelocityEMA:F4} " +
                               $"→ guard {leanGuardFrames}fr</color>");
 
                 // Set rolling window — block punches for N frames
@@ -488,6 +541,9 @@ public class AvatarController : MonoBehaviour
             _physLastT = now;
             return;
         }
+
+        // Decay hip velocity EMA when not in a lean (body is still)
+        _hipVelocityEMA = Mathf.Lerp(_hipVelocityEMA, 0f, 0.2f);
 
         if (!_punchInit)
         {
