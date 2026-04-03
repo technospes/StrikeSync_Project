@@ -233,7 +233,7 @@ public class CharacterSelectManager : MonoBehaviour
 
         // 4. Trigger idle animation
         Animator anim = model.GetComponent<Animator>();
-        if (anim != null) anim.SetTrigger("Idle");
+        //if (anim != null) anim.SetTrigger("Idle");
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────
