@@ -2,44 +2,19 @@
 using System.Diagnostics;
 
 /// <summary>
-/// PoseManager v7.0
+/// PoseManager v14.0
 ///
-/// CRITICAL FIX: Script Execution Order
+/// KEY FIX — UDP socket opens at Awake(), not StartPoseDetection().
 ///
-/// The remaining srvAge expiry bug (fresh flipping to false at srvAge=1.19→1.40)
-/// was caused by Unity's default script execution order:
+/// Previously, the socket opened during the countdown coroutine.
+/// Python starts sending immediately after model warmup (~3s).
+/// With the socket closed, the OS drops every packet silently.
+/// Opening at Awake() means port 9001 is ready from frame 1.
 ///
-///   Frame N:
-///     1. AvatarController.Update() runs FIRST
-///        → adds deltaTime to _srvAge
-///        → if _srvAge >= SERVER_EXPIRE_S (was 1.2): clears _hasSrvMoveX, zeros _srvMoveX
-///        → UpdateWalk() sees raw=0, fresh=false
-///
-///     2. PoseManager.Update() runs SECOND (default order)
-///        → drains UDP queue
-///        → calls ReceiveServerMoveX(move_x) → resets _srvAge=0
-///        → but AvatarController already used expired data this frame
-///
-/// This means any frame where the packet arrived AFTER AvatarController ran
-/// would see stale/expired data for that entire frame.  At 35fps with 29ms
-/// inter-packet gaps and 16ms Unity frames, this race occurred regularly.
-///
-/// FIX: [DefaultExecutionOrder(-10)] on PoseManager ensures it runs BEFORE
-/// AvatarController (which has default order 0).  Now the sequence is:
-///
-///   Frame N:
-///     1. PoseManager.Update() runs FIRST (order -10)
-///        → drains UDP queue, calls ReceiveServerMoveX → _srvAge reset to 0
-///
-///     2. AvatarController.Update() runs SECOND (order 0)
-///        → _srvAge is 0 (or small), _hasSrvMoveX is true
-///        → UpdateWalk() sees fresh=true, raw=correct_value  ✅
-///
-/// Combined with SERVER_EXPIRE_S raised to 2.5s in AvatarController,
-/// the srvAge expiry can no longer be accidentally triggered during normal
-/// operation regardless of UDP timing variance.
+/// ALSO: forwards calib_score and calib_ready to AvatarController
+/// so it can update calibration UI without any extra coupling.
 /// </summary>
-[DefaultExecutionOrder(-10)]  // ← CRITICAL: must run before AvatarController (order 0)
+[DefaultExecutionOrder(-10)]
 public class PoseManager : MonoBehaviour
 {
     [Tooltip("UDP Receiver listening on port 9001.")]
@@ -53,16 +28,35 @@ public class PoseManager : MonoBehaviour
 
     public GameManager gameManager;
 
+    [Header("=== PYTHON LAUNCH MODE ===")]
+    [Tooltip("TRUE  = Unity will NOT spawn pose_server.py — you start it manually before pressing Play.\n" +
+             "FALSE = Unity spawns pose_server.py automatically after the countdown.\n\n" +
+             "Set TRUE during development so you can keep the Python debug window open.\n" +
+             "Set FALSE for final build.")]
+    public bool externalPythonMode = true;   // ← DEFAULT TRUE: run Python yourself first
+
     private float _packetTimer = 0f;
     private int _packetCount = 0;
     private float _noPacketWarnTimer = 0f;
     private Process _poseServerProcess;
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Open UDP socket at Awake — before any countdown coroutine, before Start.
+    // Port 9001 will be ready from the very first frame of the scene.
+    // Python packets sent during model warmup won't be dropped by the OS.
+    // ─────────────────────────────────────────────────────────────────────────
+    void Awake()
+    {
+        if (receiver != null)
+        {
+            receiver.StartListening();
+            UnityEngine.Debug.Log(
+                "[PoseManager] UDP socket opened at Awake — port ready before Python starts.");
+        }
+    }
+
     void Update()
     {
-        // Drain ALL queued packets before AvatarController sees this frame.
-        // [DefaultExecutionOrder(-10)] guarantees we run first.
         string msg;
         int processed = 0;
         while (receiver != null && receiver.messageQueue.TryDequeue(out msg))
@@ -71,26 +65,23 @@ public class PoseManager : MonoBehaviour
             processed++;
         }
 
-        // Packet rate counter
         _packetTimer += Time.deltaTime;
         if (_packetTimer >= 1f)
         {
             if (_packetCount > 0)
                 UnityEngine.Debug.Log(
-                    $"<color=green>PoseManager v7: {_packetCount} pkt/s</color>");
+                    $"<color=green>PoseManager: {_packetCount} pkt/s</color>");
             _packetCount = 0;
             _packetTimer -= 1f;
         }
 
-        // Warn if no packets arriving at all
         if (processed == 0)
         {
             _noPacketWarnTimer += Time.deltaTime;
             if (_noPacketWarnTimer >= 5f)
             {
                 UnityEngine.Debug.LogWarning(
-                    "[PoseManager] No UDP packets for 5 s — " +
-                    "is pose_server.py running? Is port 9001 open?");
+                    "[PoseManager] No UDP packets for 5 s — is pose_server.py running?");
                 _noPacketWarnTimer = 0f;
             }
         }
@@ -100,9 +91,9 @@ public class PoseManager : MonoBehaviour
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     private void ProcessMessage(string json)
     {
+        //UnityEngine.Debug.Log("🔥 Processing UDP message");
         try
         {
             PoseDataPacket packet = JsonUtility.FromJson<PoseDataPacket>(json);
@@ -114,28 +105,30 @@ public class PoseManager : MonoBehaviour
                 AvatarController ctrl = GetController(player.id);
                 if (ctrl == null || player.landmarks == null) continue;
 
+                // SetPlayerID records the ID and sets mirrorInput.
+                // It does NOT set canFight — GameManager owns that gate
+                // via _p1Controller.canFight = true after the countdown.
                 if (ctrl.playerID != player.id) ctrl.SetPlayerID(player.id);
 
-                // Always forward keypoints (IK + punch)
                 ctrl.ReceiveKeypoints(player.landmarks);
-
-                // Unconditional — pose_server v5+ always sends valid move_x.
-                // No sentinel gate (lw_vel check was causing silent drops).
                 ctrl.ReceiveServerMoveX(player.move_x);
+                ctrl.ReceiveServerMoveZ(player.move_z);
 
-                if (player.jumped)
-                    ctrl.ReceiveJump();
+                if (player.punch_left) ctrl.ReceivePunch("Left");
+                if (player.punch_right) ctrl.ReceivePunch("Right");
+                if (player.jumped) ctrl.ReceiveJump();
+
+                ctrl.ReceiveCalibration(player.calib_score, player.calib_ready);
             }
         }
         catch (System.Exception e)
         {
             UnityEngine.Debug.LogError(
                 $"<color=red>[PoseManager] JSON error:</color> {e.Message}\n" +
-                $"JSON: {(json.Length > 100 ? json.Substring(0, 100) + "..." : json)}");
+                $"JSON snippet: {(json.Length > 120 ? json.Substring(0, 120) + "..." : json)}");
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     private AvatarController GetController(int id)
     {
         if (id == 0) return avatarPlayer1;
@@ -143,10 +136,32 @@ public class PoseManager : MonoBehaviour
         return null;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
+    /// <summary>
+    /// Called by GameManager immediately after SpawnPlayers().
+    /// Overwrites any inspector-assigned references with the ACTUAL
+    /// spawned instances — the only objects that have Animator + HealthSystem.
+    /// </summary>
+    public void RegisterPlayers(AvatarController p1, AvatarController p2)
+    {
+        avatarPlayer1 = p1;
+        avatarPlayer2 = p2;
+        UnityEngine.Debug.Log(
+            $"<color=cyan>[PoseManager] Linked to spawned players: {p1?.name}, {p2?.name}</color>");
+    }
+
     public void StartPoseDetection()
     {
+        // Socket is already open from Awake — StartListening is idempotent (no-op if running)
         if (receiver != null) receiver.StartListening();
+
+        if (externalPythonMode)
+        {
+            UnityEngine.Debug.Log(
+                "<color=yellow>[PoseManager] External Python mode — skipping auto-launch. " +
+                "Start pose_server.py manually BEFORE pressing Play in Unity.</color>");
+            return;
+        }
+
         try
         {
             string scriptPath = @"E:\StrikeSync_Project\Python_Server\pose_server.py";
@@ -156,8 +171,8 @@ public class PoseManager : MonoBehaviour
             _poseServerProcess.StartInfo.Arguments = scriptPath;
             _poseServerProcess.StartInfo.UseShellExecute = false;
             _poseServerProcess.StartInfo.CreateNoWindow = true;
-            _poseServerProcess.Start();
-            UnityEngine.Debug.Log("[PoseManager] pose_server.py v8 started.");
+            //_poseServerProcess.Start();
+            UnityEngine.Debug.Log("[PoseManager] pose_server.py started.");
         }
         catch (System.Exception e)
         {

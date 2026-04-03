@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -33,7 +33,7 @@ public class UdpReceiver : MonoBehaviour
 
         try
         {
-            client = new UdpClient(listenPort);
+            client = new UdpClient(new IPEndPoint(IPAddress.Any, listenPort));
             isListening = true; // Set the flag
 
             listenThread = new Thread(new ThreadStart(ListenLoop));
@@ -50,60 +50,69 @@ public class UdpReceiver : MonoBehaviour
 
     public void StopListening()
     {
-        isListening = false; // Signal the thread to stop
+        if (!isListening) return;
+        isListening = false;
 
-        // Abort the thread
-        if (listenThread != null && listenThread.IsAlive)
-        {
-            listenThread.Abort();
-            listenThread = null;
-        }
-
-        // Close the client
+        // Closing the client forces the blocking client.Receive() to throw a SocketException,
+        // which instantly and safely breaks us out of the while loop without using Thread.Abort()
         if (client != null)
         {
             client.Close();
             client = null;
         }
 
-        UnityEngine.Debug.Log("UDP Receiver shut down.");
+        // Wait a maximum of 1 second for the thread to cleanly exit
+        if (listenThread != null && listenThread.IsAlive)
+        {
+            listenThread.Join(1000);
+            listenThread = null;
+        }
+
+        UnityEngine.Debug.Log("UDP Receiver shut down safely.");
     }
 
     private void ListenLoop()
     {
         IPEndPoint remoteEP = new IPEndPoint(IPAddress.Any, listenPort);
-        try
+
+        while (isListening)
         {
-            // Use the volatile bool to control the loop
-            while (isListening)
+            try
             {
-                // Wait for a message
+                // Wait for a message (Blocks until data arrives or socket is closed)
                 byte[] data = client.Receive(ref remoteEP);
                 string json = Encoding.UTF8.GetString(data);
 
-                // Add the message to our thread-safe queue
+                // Keep queue small but NEVER drop newest packet
+                while (messageQueue.Count > 5)
+                {
+                    messageQueue.TryDequeue(out _); // drop OLD data
+                }
+
                 messageQueue.Enqueue(json);
             }
-        }
-        catch (ThreadAbortException)
-        {
-            // This is expected when we call Abort()
-            UnityEngine.Debug.Log("UDP Listen thread aborted.");
-        }
-        catch (SocketException)
-        {
-            // This is expected when the client is closed
-            UnityEngine.Debug.Log("UDP socket closed.");
-        }
-        catch (Exception e)
-        {
-            if (isListening) // Only log if it wasn't a planned stop
+            catch (SocketException)
             {
+                // Expected when client.Close() is called. Safely breaks the loop.
+                break;
+            }
+            catch (ObjectDisposedException)
+            {
+                // Expected if the client is disposed while blocking. Safely breaks the loop.
+                break;
+            }
+            catch (Exception e)
+            {
+                // General errors
+                if (!isListening) break;
                 UnityEngine.Debug.LogError($"UDP ListenLoop error: {e.Message}");
             }
         }
+
+        UnityEngine.Debug.Log("UDP Listen thread cleanly exited.");
     }
-    // This runs when the object is destroyed (like stopping "Play" mode)
+
+    // This runs when the object is destroyed (like stopping "Play" mode or closing the .exe)
     void OnDestroy()
     {
         StopListening();
