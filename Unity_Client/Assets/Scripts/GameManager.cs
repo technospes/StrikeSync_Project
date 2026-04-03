@@ -8,9 +8,12 @@ using UnityEngine.SceneManagement;
 /// GameManager — production version.
 ///
 /// Changes vs original:
-///   • Ripped out the old Unity Canvas countdown.
-///   • Added PlayFightIntroSequence() to trigger React's epic VS screen.
-///   • Waits 5.5s for the animation to finish before unlocking the players!
+///   • All WS events use WSEventType enum (no magic strings).
+///   • Subscribes to UnityWSBridge.OnConnected to push a state snapshot
+///     the moment the bridge connects, so React is never out of sync.
+///   • Subscribes to UnityWSBridge.OnMessage to handle rematch/main_menu
+///     commands from React.
+///   • Properly unsubscribes in OnDestroy.
 /// </summary>
 public class GameManager : MonoBehaviour
 {
@@ -23,17 +26,17 @@ public class GameManager : MonoBehaviour
     [Header("System References")]
     public PoseManager poseManager;
 
-    [Header("Player 1 UI (Legacy - Can be hidden)")]
+    [Header("Player 1 UI")]
     public Slider player1HealthBar;
     public Image player1Icon;
     public TextMeshProUGUI player1Name;
 
-    [Header("Player 2 UI (Legacy - Can be hidden)")]
+    [Header("Player 2 UI")]
     public Slider player2HealthBar;
     public Image player2Icon;
     public TextMeshProUGUI player2Name;
 
-    [Header("Match UI (Legacy - Can be hidden)")]
+    [Header("Match UI")]
     public TextMeshProUGUI countdownText;
     public TextMeshProUGUI winText;
     public Button rematchButton;
@@ -46,23 +49,19 @@ public class GameManager : MonoBehaviour
     // ── Unity lifecycle ───────────────────────────────────────────────────────
     void Start()
     {
-        // 1. Hide the old Unity UI (React is handling this now!)
-        if (countdownText != null) countdownText.gameObject.SetActive(false);
-        if (winText != null) winText.gameObject.SetActive(false);
-        if (rematchButton != null) rematchButton.gameObject.SetActive(false);
+        countdownText.gameObject.SetActive(true);
+        winText.gameObject.SetActive(false);
+        rematchButton.gameObject.SetActive(false);
 
-        // 2. Subscribe to WS events
+        // Subscribe to WS events
         if (UnityWSBridge.Instance != null)
         {
             UnityWSBridge.Instance.OnConnected += OnWSConnected;
             UnityWSBridge.Instance.OnMessage += HandleWSMessage;
         }
 
-        // 3. Spawn the chosen 3D fighters
         SpawnPlayers();
-
-        // 4. Trigger the new React Cinematic!
-        StartCoroutine(PlayFightIntroSequence());
+        StartCoroutine(StartMatchCountdown());
     }
 
     void OnDestroy()
@@ -77,6 +76,8 @@ public class GameManager : MonoBehaviour
     // ── WS handlers ───────────────────────────────────────────────────────────
     private void OnWSConnected()
     {
+        // Push current state immediately so React is never stale after a
+        // reconnect (e.g. if the bridge was restarted mid-game).
         SendState(_currentGameState);
     }
 
@@ -88,7 +89,7 @@ public class GameManager : MonoBehaviour
                 OnRematch();
                 break;
             case WSEventType.MainMenu:
-                OnRematch();
+                OnRematch(); // Same logic: stop everything and go to menu
                 break;
         }
     }
@@ -117,6 +118,7 @@ public class GameManager : MonoBehaviour
         player1.name = "Player_1";
         player2.name = "Player_2";
 
+        // Link camera + background scroller
         if (bgScroller != null)
         {
             bgScroller.player1 = player1.transform;
@@ -132,48 +134,50 @@ public class GameManager : MonoBehaviour
         _p1Controller = player1.GetComponent<AvatarController>();
         _p2Controller = player2.GetComponent<AvatarController>();
 
-        poseManager.avatarPlayer1 = _p1Controller;
-        poseManager.avatarPlayer2 = _p2Controller;
+        // Link PoseManager to the ACTUAL spawned instances (not inspector refs)
+        poseManager.RegisterPlayers(_p1Controller, _p2Controller);
 
+        // Link HealthSystem + UI
         HealthSystem p1Health = player1.GetComponent<HealthSystem>();
         HealthSystem p2Health = player2.GetComponent<HealthSystem>();
 
         p1Health.healthSlider = player1HealthBar;
-        p1Health.healthFillImage = player1HealthBar.transform.Find("Fill Area/Fill")?.GetComponent<Image>();
+        p1Health.healthFillImage = player1HealthBar.transform.Find("Fill Area/Fill").GetComponent<Image>();
         p2Health.healthSlider = player2HealthBar;
-        p2Health.healthFillImage = player2HealthBar.transform.Find("Fill Area/Fill")?.GetComponent<Image>();
+        p2Health.healthFillImage = player2HealthBar.transform.Find("Fill Area/Fill").GetComponent<Image>();
 
-        if (player1Icon != null && p1IconSprite != null) player1Icon.sprite = p1IconSprite;
-        if (player2Icon != null && p2IconSprite != null) player2Icon.sprite = p2IconSprite;
-        if (player1Name != null) player1Name.text = p1PrefabName;
-        if (player2Name != null) player2Name.text = p2PrefabName;
+        if (p1IconSprite != null) player1Icon.sprite = p1IconSprite;
+        if (p2IconSprite != null) player2Icon.sprite = p2IconSprite;
+        player1Name.text = p1PrefabName;
+        player2Name.text = p2PrefabName;
 
+        // Send player metadata to React (names for HUD labels)
         SendPlayerMeta(p1PrefabName, p2PrefabName);
 
+        // Knockout events
         p1Health.OnKnockout += () => OnGameOver(_p2Controller);
         p2Health.OnKnockout += () => OnGameOver(_p1Controller);
     }
 
-    // ── Match flow (NEW CINEMATIC SEQUENCE) ───────────────────────────────────
-    IEnumerator PlayFightIntroSequence()
+    // ── Match flow ────────────────────────────────────────────────────────────
+    IEnumerator StartMatchCountdown()
     {
-        // 1. Lock the players so they can't punch yet
-        if (_p1Controller) _p1Controller.canFight = false;
-        if (_p2Controller) _p2Controller.canFight = false;
+        SetState(GameState.Countdown);
 
-        // 2. Tell React to show the epic "ROUND ONE - FIGHT" screen
-        SetState("fight_intro");
+        countdownText.text = "3"; SendCountdown("3"); yield return new WaitForSeconds(1);
+        countdownText.text = "2"; SendCountdown("2"); yield return new WaitForSeconds(1);
+        countdownText.text = "1"; SendCountdown("1"); yield return new WaitForSeconds(1);
 
-        // 3. Wait for the React animation to finish (approx 5.5 seconds)
-        yield return new WaitForSeconds(5.5f);
+        countdownText.text = "ANNIHILATE!"; SendCountdown("FIGHT");
 
-        // 4. Start AI tracking and unlock the players!
         poseManager.StartPoseDetection();
-        if (_p1Controller) _p1Controller.canFight = true;
-        if (_p2Controller) _p2Controller.canFight = true;
+        if (_p1Controller) _p1Controller.EnableFighting();
+        if (_p2Controller) _p2Controller.EnableFighting();
 
-        // 5. Tell React to switch to the minimal fighting HUD
         SetState(GameState.Fighting);
+
+        yield return new WaitForSeconds(1);
+        countdownText.gameObject.SetActive(false);
     }
 
     void OnGameOver(AvatarController winner)
@@ -183,12 +187,9 @@ public class GameManager : MonoBehaviour
 
         poseManager.StopPoseDetection();
 
-        if (winText != null)
-        {
-            winText.text = $"{winner.name} WINS! ANNIHILATION!";
-            winText.gameObject.SetActive(true);
-        }
-        if (rematchButton != null) rematchButton.gameObject.SetActive(true);
+        winText.text = $"{winner.name} WINS! ANNIHILATION!";
+        winText.gameObject.SetActive(true);
+        rematchButton.gameObject.SetActive(true);
 
         string winnerKey = winner.playerID == 0 ? "player1" : "player2";
         UnityWSBridge.Instance?.Send(WSEventType.GameOver, winnerKey);
@@ -211,10 +212,22 @@ public class GameManager : MonoBehaviour
     private void SendState(string state) =>
         UnityWSBridge.Instance?.Send(WSEventType.StateChange, state);
 
+    private void SendCountdown(string value) =>
+        UnityWSBridge.Instance?.Send(WSEventType.Countdown, value);
+
     private void SendPlayerMeta(string p1Name, string p2Name)
     {
         if (UnityWSBridge.Instance == null) return;
 
+        string json = Newtonsoft.Json.JsonConvert.SerializeObject(new
+        {
+            type = WSEventType.StateChange.ToWireString(),
+            subtype = "player_meta",
+            p1Name,
+            p2Name
+        });
+        // Send as raw string via the bridge — React side reads subtype:"player_meta"
+        // to populate the HUD name labels.
         UnityWSBridge.Instance.Send(WSEventType.StateChange, $"player_meta|{p1Name}|{p2Name}");
     }
 }
