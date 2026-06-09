@@ -93,7 +93,7 @@ public class PoseManager : MonoBehaviour
 
     private void ProcessMessage(string json)
     {
-        //UnityEngine.Debug.Log("🔥 Processing UDP message");
+        //UnityEngine.Debug.Log(" Processing UDP message");
         try
         {
             PoseDataPacket packet = JsonUtility.FromJson<PoseDataPacket>(json);

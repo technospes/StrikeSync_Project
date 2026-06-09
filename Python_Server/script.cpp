@@ -248,7 +248,7 @@ public class AvatarController : MonoBehaviour
     private void TriggerPunch(string hand, float velocity)
     {
         if (healthSystem != null && healthSystem.IsKnockedOut()) return;
-        Debug.Log($"<color=orange>🥊 {gameObject.name} {hand} PUNCH!</color>");
+        Debug.Log($"<color=orange> {gameObject.name} {hand} PUNCH!</color>");
         
         if (hand == "Right" && rightHandHitbox) StartCoroutine(ManageHitbox(rightHandHitbox));
         if (hand == "Left" && leftHandHitbox) StartCoroutine(ManageHitbox(leftHandHitbox));

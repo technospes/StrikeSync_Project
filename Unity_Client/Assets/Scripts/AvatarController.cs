@@ -253,7 +253,7 @@ public class AvatarController : MonoBehaviour
             if (_calibLostTimer > 1f)
             {
                 _calibReady = false;
-                SetCalibrationUI("⚠ Tracking lost — step back into frame", 0f, show: true);
+                SetCalibrationUI(" Tracking lost — step back into frame", 0f, show: true);
             }
         }
         else
@@ -492,7 +492,7 @@ public class AvatarController : MonoBehaviour
         {
             // Just became calibrated
             _calibReady = true;
-            SetCalibrationUI("✅ CALIBRATED — FIGHT!", 1f, show: false);
+            SetCalibrationUI(" CALIBRATED — FIGHT!", 1f, show: false);
             Debug.Log($"<color=lime>[{name}] Calibration COMPLETE from Python</color>");
         }
         else if (!ready && _calibReady)
@@ -505,7 +505,7 @@ public class AvatarController : MonoBehaviour
         {
             string hint = score > 0.5f
                 ? $"Calibrating… {Mathf.RoundToInt(score * 100)}%"
-                : "⚠ Step back — full body must be visible";
+                : " Step back — full body must be visible";
             SetCalibrationUI(hint, score, show: true);
         }
     }
@@ -524,7 +524,7 @@ public class AvatarController : MonoBehaviour
     {
         if (kpts == null || kpts.Count < 13)
         {
-            SetCalibrationUI("⚠ Body not detected — step back, face camera", 0f, show: true);
+            SetCalibrationUI(" Body not detected — step back, face camera", 0f, show: true);
             _calibReady = false;
             return;
         }
@@ -544,7 +544,7 @@ public class AvatarController : MonoBehaviour
             if (!_calibReady)
             {
                 _calibReady = true;
-                SetCalibrationUI("✅ READY — FIGHT!", 1f, show: false);
+                SetCalibrationUI(" READY — FIGHT!", 1f, show: false);
                 Debug.Log($"<color=lime>[{name}] Calibration COMPLETE — all body parts visible</color>");
             }
         }
@@ -557,7 +557,7 @@ public class AvatarController : MonoBehaviour
         else
         {
             _calibReady = false;
-            SetCalibrationUI("⚠ Step back so your full body is visible", score, show: true);
+            SetCalibrationUI(" Step back so your full body is visible", score, show: true);
         }
     }
 

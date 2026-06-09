@@ -776,7 +776,7 @@ def evaluate_calibration(kpts, confs, frame_w, frame_h, calib_hold_counter):
         hint         (str)        — human-readable instruction for the user
     """
     if kpts is None or len(kpts) < 13:
-        return 0.0, False, 0, "⚠ Body not detected — step back and face the camera"
+        return 0.0, False, 0, " Body not detected — step back and face the camera"
 
     n_visible = 0
     missing_groups = []
@@ -805,7 +805,7 @@ def evaluate_calibration(kpts, confs, frame_w, frame_h, calib_hold_counter):
     if score >= 1.0:
         calib_hold_counter += 1
         is_ready = calib_hold_counter >= CALIB_HOLD_FRAMES
-        hint = "✅ READY — hold still" if not is_ready else "✅ CALIBRATED — FIGHT!"
+        hint = " READY — hold still" if not is_ready else " CALIBRATED — FIGHT!"
     else:
         calib_hold_counter = 0
         is_ready = False
@@ -962,7 +962,7 @@ def main():
         if cuda_available:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
-        print("[MODEL] Warmed up ✓")
+        print("[MODEL] Warmed up ")
     except Exception as e:
         print(f"[ERROR] Model load failed: {e}")
         return
@@ -1001,7 +1001,7 @@ def main():
         print(f"[DEBUG] Camera window open: '{DEBUG_WINDOW_NAME}'")
 
     print("=" * 60)
-    print("🚀 STRIKESYNC SERVER v13.0 — Python Punch Detection")
+    print(" STRIKESYNC SERVER v13.0 — Python Punch Detection")
     print(f"   Device          : {DEVICE.upper()}")
     print(f"   Punch vel thr   : {PUNCH_VEL_THRESHOLD:.3f} norm/s")
     print(f"   Retraction vel  : {RETRACTION_VEL:.3f} norm/s  (reset gate)")
@@ -1101,7 +1101,7 @@ def main():
                     move_x = ps.compute_move_x(kpts, frame_w)
                     move_z = ps.compute_move_z(kpts, frame_w)
 
-                    # 🔥 THE PRE-PUNCH FLINCH FIX (YOU MISSED THIS!) 🔥
+                    #  THE PRE-PUNCH FLINCH FIX (YOU MISSED THIS!) 
                     # If arms are winding up (intent), mute the legs BEFORE sending to Unity!
                     # This prevents the hip-twist from triggering a walk animation.
                     intent_l = (now - ps.hand_left.intent_time) < INTENT_WINDOW_S
@@ -1219,7 +1219,7 @@ def main():
 
             if time.time() - last_report >= 2.0:
                 avg_fps = len(fps_times) / sum(fps_times) if fps_times else 0
-                status  = "✅" if avg_fps >= TARGET_FPS * 0.9 else "⚡"
+                status  = "" if avg_fps >= TARGET_FPS * 0.9 else ""
                 p0      = player_states[0]
                 m_str   = f"{move_x:+.3f}"
                 z_str   = f"{move_z:+.3f}"

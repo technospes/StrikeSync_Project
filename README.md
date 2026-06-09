@@ -1,10 +1,10 @@
-# StrikeSync: AI-Powered Motion Combat Interface 🥊
+# StrikeSync: AI-Powered Motion Combat Interface 
 
 Turn your webcam into a real-time motion capture controller for fighting games.
 
 StrikeSync is a low-latency, markerless human–computer interface (HCI) that bridges computer vision and game development. By leveraging the YOLO11 pose estimation model to track full-body movement in real time and streaming data to Unity via UDP, it enables a “play-as-you-fight” experience without the need for VR headsets or mocap suits. 
 
-**🔥 What's NEW :** StrikeSync now features a fully integrated Web UI and WebSocket Bridge for seamless character and map selection, alongside a rebuilt zero-drift motion tracking engine!
+** What's NEW :** StrikeSync now features a fully integrated Web UI and WebSocket Bridge for seamless character and map selection, alongside a rebuilt zero-drift motion tracking engine!
 
 ---
 
@@ -26,7 +26,7 @@ StrikeSync is a low-latency, markerless human–computer interface (HCI) that br
 
 ## Demo
 
-> 🚀 **v5.0 is LIVE!** Watch the gameplay demo on YouTube [Link coming soon...]
+>  **v5.0 is LIVE!** Watch the gameplay demo on YouTube [Link coming soon...]
 
 Examples:
 - Real-time combat where physical punches and dodges translate directly into in‑game actions.
